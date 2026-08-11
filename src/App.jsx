@@ -1151,15 +1151,16 @@ function InterviewBooking({ data, onBook, go }) {
         <div className={slideCls} key="s3">
           <h3 className="step-h">Pick a time <span className="muted">· {prettyDate(date)}</span></h3>
           <p className="muted" style={{ marginTop: -6 }}>Each session is ~65 minutes: 15-min behavioral, 5-min transition, 45-min case.</p>
-          <div className="pill-grid">
+          <div className="time-box-grid">
             {openCohortsOn(data, ev, date).map((c, i) => {
               const left = cohortRemaining(data, ev, date, c.id);
               return (
                 <button key={c.id}
-                  className={`pill stagger${cohortId === c.id ? " is-selected" : ""}`}
+                  className={`time-box stagger${cohortId === c.id ? " is-selected" : ""}`}
                   style={{ animationDelay: `${Math.min(i * 25, 300)}ms` }}
                   onClick={() => setCohortId(c.id)}>
-                  {c.start} <span className="pill-sub">· {left === 1 ? "1 left" : `${left} left`}</span>
+                  <b>{c.start}</b>
+                  <span>{left === 1 ? "1 spot left" : `${left} spots left`}</span>
                 </button>
               );
             })}
@@ -1331,6 +1332,7 @@ function InterviewAdmin({ data, save, logout }) {
 
       {dateTabs && (
         <div className="date-tabs">
+          <span className="date-tabs-label">Interview date:</span>
           {dates.map((d) => (
             <button key={d} className={`date-tab${activeDate === d ? " on" : ""}`} onClick={() => setActiveDate(d)}>
               {shortDay(d)} {shortDate(d)}
@@ -1355,16 +1357,63 @@ function IADashboard({ data, ev, date }) {
   if (!date) return <div className="empty-state fadein"><p>This event has no interview dates yet.</p><p className="muted">Add dates in <b>Settings</b>.</p></div>;
   const cohorts = cohortTimes(ev);
   const totalCap = cohorts.reduce((n, c) => n + cohortCapacity(ev, date, c.id), 0);
-  const scheduled = cohorts.reduce((n, c) => n + candidatesInCohort(data, ev.id, date, c.id).length, 0);
-  const fullCount = cohorts.filter((c) => cohortRemaining(data, ev, date, c.id) <= 0).length;
+  const dayCandidates = cohorts.flatMap((c) => candidatesInCohort(data, ev.id, date, c.id));
+  const scheduled = dayCandidates.length;
+
+  /* completion: candidates who've moved past behavioral (Case Interview / Waiting-after / Completed) */
+  const PAST_BEHAVIORAL = ["Waiting", "Case Interview", "Completed"];
+  const doneCount = dayCandidates.filter((c) => PAST_BEHAVIORAL.includes(c.status)).length;
+  const completedCount = dayCandidates.filter((c) => c.status === "Completed").length;
+  const pct = scheduled ? Math.round((doneCount / scheduled) * 100) : 0;
+
+  /* on-time vs behind: compare NOW to the scheduled progress.
+     Expected progress = how many cohorts should have finished behavioral by now. */
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const isToday = date === now.toISOString().slice(0, 10);
+  /* by the clock, each cohort's behavioral is "done" behavioralMin after its start */
+  let expectedDone = 0, totalWithCands = 0;
+  cohorts.forEach((c) => {
+    const list = candidatesInCohort(data, ev.id, date, c.id);
+    if (list.length === 0) return;
+    totalWithCands += list.length;
+    if (nowMin >= c.startMin + ev.behavioralMin) expectedDone += list.length;
+  });
+  const expectedPct = totalWithCands ? Math.round((expectedDone / totalWithCands) * 100) : 0;
+  let timing = null;
+  if (isToday && totalWithCands > 0 && expectedDone > 0) {
+    const diff = pct - expectedPct;
+    timing = diff >= -5 ? { label: "On time", cls: "ontime" }
+      : diff >= -20 ? { label: "Slightly behind", cls: "slight" }
+      : { label: "Behind schedule", cls: "behind" };
+  }
 
   return (
     <div className="fadein">
-      <div className="stats stats-5">
-        {[["Total spots", totalCap], ["Scheduled", scheduled], ["Remaining", totalCap - scheduled],
-          ["Cohorts", cohorts.length], ["Full cohorts", fullCount]].map(([k, v]) => (
-          <div key={k} className="card stat"><span>{k}</span><b>{v}</b></div>
-        ))}
+      <div className="day-banner">
+        <div>
+          <span className="day-banner-date">{prettyDate(date)}</span>
+          <span className="muted"> · {(ev.location?.building || "")}{ev.location?.room ? ` ${ev.location.room}` : ""}</span>
+        </div>
+        {timing && <span className={`timing-badge ${timing.cls}`}>{timing.label}</span>}
+      </div>
+
+      {/* live progress ring */}
+      <div className="progress-hero">
+        <div className="ring-wrap">
+          <svg viewBox="0 0 120 120" className="ring-svg">
+            <circle cx="60" cy="60" r="52" className="ring-bg" />
+            <circle cx="60" cy="60" r="52" className="ring-fg"
+              style={{ strokeDasharray: 2 * Math.PI * 52, strokeDashoffset: 2 * Math.PI * 52 * (1 - pct / 100) }} />
+          </svg>
+          <div className="ring-label"><b>{pct}%</b><span>through</span></div>
+        </div>
+        <div className="progress-facts">
+          <div className="fact"><b>{scheduled}</b><span>booked today</span></div>
+          <div className="fact"><b>{doneCount}</b><span>past behavioral</span></div>
+          <div className="fact"><b>{completedCount}</b><span>fully done</span></div>
+          <div className="fact"><b>{totalCap - scheduled}</b><span>open spots</span></div>
+        </div>
       </div>
 
       <div className="cohort-cards">
@@ -1372,27 +1421,37 @@ function IADashboard({ data, ev, date }) {
           const list = candidatesInCohort(data, ev.id, date, c.id);
           const cap = cohortCapacity(ev, date, c.id);
           const left = cap - list.length;
-          const pct = cap ? Math.round((list.length / cap) * 100) : 0;
+          const capPct = cap ? Math.round((list.length / cap) * 100) : 0;
           const full = left <= 0;
           const closed = cohortClosed(ev, date, c.id);
+          const past = list.filter((cd) => PAST_BEHAVIORAL.includes(cd.status)).length;
+          const started = isToday && nowMin >= c.startMin;
+          const finished = isToday && nowMin >= c.startMin + cohortDuration(ev);
           return (
-            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}`}>
+            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${started && !finished ? " live" : ""}`}>
               <div className="cc-head">
                 <b>{c.start}</b>
-                <span className={`badge${full ? " full" : closed ? " closed" : " open"}`}>
-                  {closed ? "Closed" : full ? "FULL" : left === 1 ? "1 spot left" : `${left} spots left`}
-                </span>
+                {started && !finished ? <span className="badge live-badge">● In progress</span>
+                  : finished ? <span className="badge closed">Ended</span>
+                  : <span className={`badge${full ? " full" : closed ? " closed" : " open"}`}>
+                      {closed ? "Closed" : full ? "FULL" : left === 1 ? "1 spot left" : `${left} spots left`}
+                    </span>}
               </div>
-              <div className="cc-bar"><i style={{ width: `${pct}%` }} /></div>
-              <div className="cc-count">{list.length} / {cap} candidates</div>
+              <div className="cc-bar"><i style={{ width: `${capPct}%` }} /></div>
+              <div className="cc-count">{list.length} / {cap} candidates{list.length > 0 ? ` · ${past} past behavioral` : ""}</div>
               <div className="cc-list">
                 {list.length === 0 ? <span className="muted">No candidates yet</span> :
-                  list.map((cd) => <span key={cd.id} className="cc-name">{cd.name}</span>)}
+                  list.map((cd) => (
+                    <span key={cd.id} className="cc-name">
+                      <span className={`dot s-${cd.status.replace(/\s+/g, "").toLowerCase()}`} />{cd.name}
+                    </span>
+                  ))}
               </div>
             </div>
           );
         })}
       </div>
+      <p className="fine" style={{ marginTop: 16 }}>Update each candidate's status in the <b>Interview Day</b> tab — this dashboard reflects it live.</p>
     </div>
   );
 }
@@ -1846,6 +1905,18 @@ nav { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap
 .pill.off { background: #F5F5F2; color: #BBB; text-decoration: line-through; cursor: not-allowed; }
 .pill.avail { background: var(--tint); border: 2px solid var(--green); }
 .pill.blocked { color: #C0392B; border-color: #C0392B; text-decoration: line-through; }
+
+/* interview time slots — always-visible clear boxes (like member date cards) */
+.time-box-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-top: 14px; max-width: 640px; }
+.time-box { display: flex; flex-direction: column; gap: 4px; align-items: center; justify-content: center;
+  padding: 18px 12px; border-radius: 14px; border: 2px solid var(--green); background: var(--tint); cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif; box-shadow: 0 1px 4px rgba(17,17,17,.03);
+  transition: background .25s, color .25s, box-shadow .25s, transform .2s cubic-bezier(.22,1,.36,1); }
+.time-box b { font-size: 19px; color: #111; }
+.time-box span { font-size: 12.5px; color: var(--greenDark); font-weight: 600; }
+.time-box:hover:not(.is-selected) { background: #E9F2DA; transform: translateY(-2px); box-shadow: 0 8px 18px rgba(118,169,53,.16); }
+.time-box.is-selected { background: var(--green); border-color: var(--green); box-shadow: 0 8px 20px rgba(118,169,53,.3); }
+.time-box.is-selected b, .time-box.is-selected span { color: #fff; }
 .pill.booked { background: #EEE; color: #999; cursor: not-allowed; }
 
 /* per-day times table */
@@ -2125,7 +2196,8 @@ tr:hover td { background: #FAFBF7; }
 
 
 /* ============ multi-day admin + polish ============ */
-.date-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+.date-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; align-items: center; }
+.date-tabs-label { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 12.5px; color: #888; margin-right: 4px; }
 .date-tab { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 13px; padding: 8px 15px;
   border-radius: 999px; border: 1.5px solid #E0E0DB; background: #fff; color: #666; cursor: pointer; transition: all .2s; }
 .date-tab:hover { border-color: var(--green); }
@@ -2168,6 +2240,46 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .section-tint { background: var(--tint); }
 .notice { background: linear-gradient(180deg, #FFF9E9, #FFF4D6); border: 1px solid #F0D98A; color: #7A5B00;
   border-radius: 12px; padding: 12px 16px; font-size: 13.5px; margin-bottom: 16px; font-weight: 500; }
+
+
+/* ============ live interview-day dashboard ============ */
+.day-banner { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+  padding: 14px 18px; border-radius: 14px; background: linear-gradient(180deg, #FCFDFA, #F4F8EC);
+  border: 1px solid #E5EFD4; margin-bottom: 18px; }
+.day-banner-date { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 16px; }
+.timing-badge { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 12.5px; padding: 6px 14px; border-radius: 999px; }
+.timing-badge.ontime { background: #E6F4EA; color: #1E7E34; }
+.timing-badge.slight { background: #FFF4D6; color: #7A5B00; }
+.timing-badge.behind { background: #FDECEA; color: #C0392B; }
+
+.progress-hero { display: flex; align-items: center; gap: 28px; flex-wrap: wrap; padding: 22px 24px;
+  border: 1.5px solid #E7E7E2; border-radius: 18px; background: linear-gradient(180deg, #fff, #FCFDFA);
+  box-shadow: 0 2px 12px rgba(17,17,17,.035); margin-bottom: 22px; }
+.ring-wrap { position: relative; width: 120px; height: 120px; flex-shrink: 0; }
+.ring-svg { width: 120px; height: 120px; transform: rotate(-90deg); }
+.ring-bg { fill: none; stroke: #EDEDEA; stroke-width: 11; }
+.ring-fg { fill: none; stroke: var(--green); stroke-width: 11; stroke-linecap: round;
+  transition: stroke-dashoffset .8s cubic-bezier(.22,1,.36,1); }
+.ring-label { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.ring-label b { font-family: 'Space Grotesk', sans-serif; font-size: 30px; line-height: 1;
+  background: linear-gradient(180deg, var(--green), var(--greenDark)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.ring-label span { font-size: 11px; color: #999; font-weight: 600; margin-top: 2px; }
+.progress-facts { display: grid; grid-template-columns: repeat(2, auto); gap: 14px 34px; }
+.fact b { display: block; font-family: 'Space Grotesk', sans-serif; font-size: 26px; color: #111; line-height: 1; }
+.fact span { font-size: 12.5px; color: #888; font-weight: 600; }
+
+.cohort-card.live { border-color: var(--green); box-shadow: 0 8px 22px rgba(118,169,53,.18); }
+.live-badge { background: var(--green); color: #fff; animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+.cc-name { display: flex; align-items: center; gap: 7px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #CCC; flex-shrink: 0; }
+.dot.s-checkedin { background: #2B6CB0; }
+.dot.s-behavioral { background: #E0A800; }
+.dot.s-waiting { background: #9333EA; }
+.dot.s-caseinterview { background: var(--green); }
+.dot.s-completed { background: #1E7E34; }
+.dot.s-noshow { background: #C0392B; }
+@media (max-width: 720px) { .progress-facts { grid-template-columns: repeat(2, auto); } }
 
     `}</style>
   );
