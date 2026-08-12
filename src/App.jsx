@@ -108,7 +108,8 @@ const emptyData = {
   bookings: [], closedSlots: [], memberAvail: {}, memberLinks: {}, availSetAt: {},
   /* prospective-consultant interview system */
   interviewEvents: [],   // [{ id, name, dates:["YYYY-MM-DD"], location{building,room,address,notes}, startTime, endTime, behavioralMin, bufferMin, caseMin, candidatesPerCohort, cohortIntervalMin, cohortMeta:{}, arrivalInstruction }]
-  candidates: [],        // [{ id, eventId, date, cohortId, name, email, purdueId, phone, major, gradYear, status, createdAt, cancelled }]
+  candidates: [],        // [{ id, eventId, date, cohortId, name, email, purdueId, phone, status, createdAt, cancelled }]
+  interviewTimers: {},   // { "<eventId>|<date>|<cohortId>": startMs }
 };
 
 /* Effective Teams link for a member: link saved in the Team Area wins,
@@ -275,6 +276,7 @@ async function sendCandidateEmail(cand, ev, cohort, date) {
     format: "15-min Behavioral · 5-min Transition · 45-min Case Interview",
     booking_id: cand.id,
     arrival_note: ev.arrivalInstruction || CONFIG.arrivalInstruction,
+    manage_link: `${(typeof window !== "undefined" ? window.location.origin : "")}/?manage=${cand.id}`,
   };
   try {
     await fetch("https://api.emailjs.com/api/v1.0/email/send", {
@@ -410,6 +412,12 @@ export default function App() {
   useEffect(() => { dataRef.current = data; }, [data]);
 
   useEffect(() => { document.title = CONFIG.siteName; }, []);
+  const [manageId, setManageId] = useState(null);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const m = params.get("manage");
+    if (m) { setManageId(m); setPage("manage"); }
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -490,11 +498,21 @@ export default function App() {
     if (!ev || !cohort) return { ok: false, msg: "That interview is no longer available." };
     if (cohortClosed(ev, date, cohortId) || cohortRemaining(data, ev, date, cohortId) <= 0)
       return { ok: false, msg: "That time just filled up — please pick another slot." };
+    /* double-booking guard: same email or Purdue ID already booked in this event */
+    const email = form.email.trim().toLowerCase();
+    const pid = form.purdueId.trim().toLowerCase();
+    const dup = (dataRef.current.candidates || []).find((c) =>
+      c.eventId === eventId && !c.cancelled &&
+      (c.email.trim().toLowerCase() === email || (pid && c.purdueId.trim().toLowerCase() === pid)));
+    if (dup) {
+      const dupCohort = cohortTimes(ev).find((c) => c.id === dup.cohortId);
+      return { ok: false, dup, msg: `You already have an interview booked for this event on ${prettyDate(dup.date)} at ${dupCohort ? dupCohort.start : ""}. Use your confirmation email's manage link to change it.` };
+    }
     const cand = {
       id: `IV-${Date.now().toString(36).toUpperCase()}`,
       eventId, date, cohortId,
       name: form.name.trim(), email: form.email.trim(), purdueId: form.purdueId.trim(),
-      phone: (form.phone || "").trim(), major: (form.major || "").trim(), gradYear: (form.gradYear || "").trim(),
+      phone: (form.phone || "").trim(),
       status: "Not Arrived", createdAt: new Date().toISOString(), cancelled: false,
     };
     await save((prev) => ({ ...prev, candidates: [...(prev.candidates || []), cand] }));
@@ -503,6 +521,20 @@ export default function App() {
     setCandEmailStatus("pending");
     const r = await sendCandidateEmail(cand, ev, cohort, date);
     setCandEmailStatus(r.sent ? "sent" : "manual");
+    return { ok: true };
+  };
+
+  const cancelCandidate = async (candId) =>
+    save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? { ...c, cancelled: true } : c) }));
+
+  const rescheduleCandidate = async (candId, newDate, newCohortId) => {
+    const cand = (dataRef.current.candidates || []).find((c) => c.id === candId);
+    if (!cand) return { ok: false, msg: "Booking not found." };
+    const ev = eventById(dataRef.current, cand.eventId);
+    if (!ev) return { ok: false, msg: "Interview event not found." };
+    if (cohortClosed(ev, newDate, newCohortId) || cohortRemaining(dataRef.current, ev, newDate, newCohortId) <= 0)
+      return { ok: false, msg: "That time just filled up — please pick another." };
+    await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? { ...c, date: newDate, cohortId: newCohortId, status: "Not Arrived" } : c) }));
     return { ok: true };
   };
 
@@ -526,6 +558,9 @@ export default function App() {
           <InterviewBooking key="ivbook" data={data} onBook={bookCandidate} go={go} />
         ) : page === "iv-confirm" ? (
           <CandidateConfirmation key="ivconf" info={lastCandidate} emailStatus={candEmailStatus} go={go} />
+        ) : page === "manage" ? (
+          <ManageBooking key="manage" data={data} manageId={manageId} onCancel={cancelCandidate} onReschedule={rescheduleCandidate}
+            go={(p) => { window.history.replaceState({}, "", window.location.pathname); go(p); }} />
         ) : page === "iv-admin" && !ivAdmin ? (
           <InterviewAdminLogin key="ival" onSuccess={() => setIvAdmin(true)} />
         ) : page === "iv-admin" && ivAdmin ? (
@@ -1058,7 +1093,7 @@ function InterviewBooking({ data, onBook, go }) {
 
   const [step, setStep] = useState(1);          // 1 Details · 2 Date · 3 Time · 4 Confirm
   const [dir, setDir] = useState(1);
-  const [form, setForm] = useState({ name: "", email: "", purdueId: "", phone: "", major: "", gradYear: "" });
+  const [form, setForm] = useState({ name: "", email: "", purdueId: "", phone: "" });
   const [date, setDate] = useState(null);
   const [cohortId, setCohortId] = useState(null);
   const [error, setError] = useState("");
@@ -1075,7 +1110,7 @@ function InterviewBooking({ data, onBook, go }) {
   const submit = async () => {
     if (!ev || !date || !cohortId) return setError("Please choose a date and time.");
     const r = await onBook(ev.id, date, cohortId, form);
-    if (!r.ok) { setError(r.msg); setStep(3); setCohortId(null); }
+    if (!r.ok) { setError(r.msg); setStep(r.dup ? 1 : 3); if (!r.dup) setCohortId(null); }
   };
 
   if (!ev || events.length === 0) {
@@ -1122,11 +1157,7 @@ function InterviewBooking({ data, onBook, go }) {
             <Field label="Full name" value={form.name} onChange={set("name")} placeholder="Boiler Maker" autoComplete="name" />
             <Field label="Purdue email" type="email" value={form.email} onChange={set("email")} placeholder="you@purdue.edu" autoComplete="email" />
             <Field label="Purdue ID" value={form.purdueId} onChange={set("purdueId")} placeholder="0012345678" />
-            <div className="field-row">
-              <Field label="Phone (optional)" value={form.phone} onChange={set("phone")} placeholder="(765) 555-0123" />
-              <Field label="Graduation year (optional)" value={form.gradYear} onChange={set("gradYear")} placeholder="2027" />
-            </div>
-            <Field label="Major (optional)" value={form.major} onChange={set("major")} placeholder="Data Science" />
+            <Field label="Phone (optional)" value={form.phone} onChange={set("phone")} placeholder="(765) 555-0123" />
             {error && <p className="err">{error}</p>}
           </div>
         </div>
@@ -1203,6 +1234,116 @@ function InterviewBooking({ data, onBook, go }) {
   );
 }
 
+
+/* ---- Candidate self-service: cancel or reschedule via ?manage=ID link ---- */
+function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
+  const cand = (data.candidates || []).find((c) => c.id === manageId);
+  const [mode, setMode] = useState("view");    // view · reschedule · cancelled · done
+  const [newDate, setNewDate] = useState(null);
+  const [newCohort, setNewCohort] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  if (!cand) {
+    return (
+      <section className="page narrow">
+        <h2 className="rise d1">Manage your interview</h2>
+        <div className="empty-state rise d2"><p>We couldn't find that booking.</p>
+          <p className="muted">It may have been cancelled already. Questions? <a href={`mailto:${CONFIG.clubEmail}`}>{CONFIG.clubEmail}</a></p></div>
+        <div className="rise d3"><Btn kind="outline" onClick={() => go("home")}>← Back to Home</Btn></div>
+      </section>
+    );
+  }
+
+  const ev = eventById(data, cand.eventId);
+  const cohort = ev ? cohortTimes(ev).find((c) => c.id === cand.cohortId) : null;
+  const loc = ev?.location || {};
+
+  if (cand.cancelled || mode === "cancelled") {
+    return (
+      <section className="page narrow confirm">
+        <div className="check gray"><svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="#fff" strokeWidth="3" strokeLinecap="round" /></svg></div>
+        <h2 className="rise d2">Interview cancelled</h2>
+        <p className="muted rise d2">Your interview has been cancelled and the slot reopened. If this was a mistake, you can book again.</p>
+        <div className="rise d3" style={{ marginTop: 12 }}><Btn onClick={() => go("interview")}>Book a new time →</Btn></div>
+      </section>
+    );
+  }
+
+  const doCancel = async () => { await onCancel(cand.id); setMode("cancelled"); };
+  const doReschedule = async () => {
+    if (!newDate || !newCohort) return setMsg("Pick a new date and time.");
+    const r = await onReschedule(cand.id, newDate, newCohort);
+    if (!r.ok) return setMsg(r.msg);
+    setMode("done");
+  };
+
+  if (mode === "done") {
+    const nc = cohortTimes(ev).find((c) => c.id === newCohort);
+    return (
+      <section className="page narrow confirm">
+        <div className="check"><svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg></div>
+        <h2 className="rise d2">Interview rescheduled</h2>
+        <p className="muted rise d2">You're now booked for <b>{prettyDate(newDate)}</b> at <b>{nc?.start}</b>.</p>
+        <div className="rise d3" style={{ marginTop: 12 }}><Btn kind="outline" onClick={() => go("home")}>← Back to Home</Btn></div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="page narrow">
+      <h2 className="rise d1">Manage your interview</h2>
+      <div className="card detail-card rise d2" style={{ marginTop: 12 }}>
+        <div className="d-row"><span>Name</span><b>{cand.name}</b></div>
+        <div className="d-row"><span>Date</span><b>{prettyDate(cand.date)}</b></div>
+        <div className="d-row"><span>Time</span><b>{cohort?.start}</b></div>
+        <div className="d-row"><span>Location</span><b>{[loc.building, loc.room && `Room ${loc.room}`].filter(Boolean).join(", ") || "TBA"}</b></div>
+        <div className="d-row"><span>Confirmation</span><b>{cand.id}</b></div>
+      </div>
+
+      {mode === "view" && (
+        <div className="rise d3 manage-actions">
+          <Btn onClick={() => { setMode("reschedule"); setNewDate(cand.date); }}>Reschedule</Btn>
+          <Btn kind="danger" onClick={doCancel}>Cancel interview</Btn>
+          <Btn kind="outline" onClick={() => go("home")}>Back to Home</Btn>
+        </div>
+      )}
+
+      {mode === "reschedule" && (
+        <div className="rise d3" style={{ marginTop: 18 }}>
+          <h3 className="step-h">Pick a new date</h3>
+          <div className="date-grid">
+            {openDates(data, ev).map((d) => (
+              <button key={d} className={`date-card${newDate === d ? " is-selected" : ""}`}
+                onClick={() => { setNewDate(d); setNewCohort(null); }}>
+                <span>{shortDay(d)}</span><b>{shortDate(d)}</b>
+              </button>
+            ))}
+          </div>
+          {newDate && (
+            <>
+              <h3 className="step-h" style={{ marginTop: 20 }}>Pick a new time</h3>
+              <div className="time-box-grid">
+                {openCohortsOn(data, ev, newDate).map((c) => {
+                  const left = cohortRemaining(data, ev, newDate, c.id);
+                  return (
+                    <button key={c.id} className={`time-box${newCohort === c.id ? " is-selected" : ""}`} onClick={() => setNewCohort(c.id)}>
+                      <b>{c.start}</b><span>{left === 1 ? "1 spot left" : `${left} spots left`}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+          {msg && <p className="err">{msg}</p>}
+          <div className="manage-actions" style={{ marginTop: 18 }}>
+            <Btn onClick={doReschedule} disabled={!newDate || !newCohort}>Confirm new time</Btn>
+            <Btn kind="outline" onClick={() => { setMode("view"); setMsg(""); }}>Back</Btn>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function CandidateConfirmation({ info, emailStatus, go }) {
   if (!info) return <Landing go={go} />;
@@ -1341,7 +1482,7 @@ function InterviewAdmin({ data, save, logout }) {
         </div>
       )}
 
-      {tab === "dashboard" && <IADashboard data={data} ev={activeEvent} date={activeDate} />}
+      {tab === "dashboard" && <IADashboard data={data} save={save} ev={activeEvent} date={activeDate} />}
       {tab === "events" && <IAEvents data={data} save={save} activeEventId={activeEventId} setActiveEventId={setActiveEventId} />}
       {tab === "candidates" && <IACandidates data={data} save={save} ev={activeEvent} />}
       {tab === "dayof" && <IADayOf data={data} save={save} ev={activeEvent} date={activeDate} />}
@@ -1352,41 +1493,39 @@ function InterviewAdmin({ data, save, logout }) {
 }
 
 /* ---- Dashboard: summary + cohort capacity for the selected date ---- */
-function IADashboard({ data, ev, date }) {
+function IADashboard({ data, save, ev, date }) {
+  /* live ticking clock so timers + "now" update every second */
+  const [, force] = useState(0);
+  useEffect(() => { const t = setInterval(() => force((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+
   if (!ev) return <EmptyEvents />;
   if (!date) return <div className="empty-state fadein"><p>This event has no interview dates yet.</p><p className="muted">Add dates in <b>Settings</b>.</p></div>;
+
   const cohorts = cohortTimes(ev);
+  const dur = cohortDuration(ev); // 65 min planned
   const totalCap = cohorts.reduce((n, c) => n + cohortCapacity(ev, date, c.id), 0);
   const dayCandidates = cohorts.flatMap((c) => candidatesInCohort(data, ev.id, date, c.id));
   const scheduled = dayCandidates.length;
+  const doneCount = dayCandidates.filter((c) => c.status === "Completed").length;
 
-  /* completion: candidates who've moved past behavioral (Case Interview / Waiting-after / Completed) */
-  const PAST_BEHAVIORAL = ["Waiting", "Case Interview", "Completed"];
-  const doneCount = dayCandidates.filter((c) => PAST_BEHAVIORAL.includes(c.status)).length;
-  const completedCount = dayCandidates.filter((c) => c.status === "Completed").length;
-  const pct = scheduled ? Math.round((doneCount / scheduled) * 100) : 0;
+  /* per-candidate progress: which of the 3 stages they've reached */
+  const stageIndex = (status) => {
+    if (status === "Completed") return 3;
+    if (status === "Case Interview") return 2;
+    if (status === "Waiting") return 2;         // between behavioral and case
+    if (status === "Behavioral" || status === "Checked In") return 1;
+    if (status === "No Show") return -1;
+    return 0;                                    // Not Arrived
+  };
 
-  /* on-time vs behind: compare NOW to the scheduled progress.
-     Expected progress = how many cohorts should have finished behavioral by now. */
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const isToday = date === now.toISOString().slice(0, 10);
-  /* by the clock, each cohort's behavioral is "done" behavioralMin after its start */
-  let expectedDone = 0, totalWithCands = 0;
-  cohorts.forEach((c) => {
-    const list = candidatesInCohort(data, ev.id, date, c.id);
-    if (list.length === 0) return;
-    totalWithCands += list.length;
-    if (nowMin >= c.startMin + ev.behavioralMin) expectedDone += list.length;
-  });
-  const expectedPct = totalWithCands ? Math.round((expectedDone / totalWithCands) * 100) : 0;
-  let timing = null;
-  if (isToday && totalWithCands > 0 && expectedDone > 0) {
-    const diff = pct - expectedPct;
-    timing = diff >= -5 ? { label: "On time", cls: "ontime" }
-      : diff >= -20 ? { label: "Slightly behind", cls: "slight" }
-      : { label: "Behind schedule", cls: "behind" };
-  }
+  /* timers live in data.interviewTimers["<eventId>|<date>|<cohortId>"] = startMs */
+  const timerKey = (cid) => `${ev.id}|${date}|${cid}`;
+  const timers = data.interviewTimers || {};
+  const startTimer = (cid) => save((prev) => ({ ...prev, interviewTimers: { ...(prev.interviewTimers || {}), [timerKey(cid)]: Date.now() } }));
+  const resetTimer = (cid) => save((prev) => { const t = { ...(prev.interviewTimers || {}) }; delete t[timerKey(cid)]; return { ...prev, interviewTimers: t }; });
+
+  const now = Date.now();
+  const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 
   return (
     <div className="fadein">
@@ -1395,24 +1534,10 @@ function IADashboard({ data, ev, date }) {
           <span className="day-banner-date">{prettyDate(date)}</span>
           <span className="muted"> · {(ev.location?.building || "")}{ev.location?.room ? ` ${ev.location.room}` : ""}</span>
         </div>
-        {timing && <span className={`timing-badge ${timing.cls}`}>{timing.label}</span>}
-      </div>
-
-      {/* live progress ring */}
-      <div className="progress-hero">
-        <div className="ring-wrap">
-          <svg viewBox="0 0 120 120" className="ring-svg">
-            <circle cx="60" cy="60" r="52" className="ring-bg" />
-            <circle cx="60" cy="60" r="52" className="ring-fg"
-              style={{ strokeDasharray: 2 * Math.PI * 52, strokeDashoffset: 2 * Math.PI * 52 * (1 - pct / 100) }} />
-          </svg>
-          <div className="ring-label"><b>{pct}%</b><span>through</span></div>
-        </div>
-        <div className="progress-facts">
-          <div className="fact"><b>{scheduled}</b><span>booked today</span></div>
-          <div className="fact"><b>{doneCount}</b><span>past behavioral</span></div>
-          <div className="fact"><b>{completedCount}</b><span>fully done</span></div>
-          <div className="fact"><b>{totalCap - scheduled}</b><span>open spots</span></div>
+        <div className="day-summary">
+          <span><b>{scheduled}</b> booked</span>
+          <span><b>{doneCount}</b> completed</span>
+          <span><b>{totalCap - scheduled}</b> open</span>
         </div>
       </div>
 
@@ -1420,38 +1545,65 @@ function IADashboard({ data, ev, date }) {
         {cohorts.map((c) => {
           const list = candidatesInCohort(data, ev.id, date, c.id);
           const cap = cohortCapacity(ev, date, c.id);
-          const left = cap - list.length;
-          const capPct = cap ? Math.round((list.length / cap) * 100) : 0;
-          const full = left <= 0;
           const closed = cohortClosed(ev, date, c.id);
-          const past = list.filter((cd) => PAST_BEHAVIORAL.includes(cd.status)).length;
-          const started = isToday && nowMin >= c.startMin;
-          const finished = isToday && nowMin >= c.startMin + cohortDuration(ev);
+          const cohortDone = list.filter((x) => x.status === "Completed").length;
+          const cohortPct = list.length ? Math.round((cohortDone / list.length) * 100) : 0;
+
+          const startMs = timers[timerKey(c.id)];
+          const running = !!startMs;
+          const elapsedMs = running ? now - startMs : 0;
+          const overtime = running && elapsedMs > dur * 60 * 1000;
+          const nearEnd = running && !overtime && elapsedMs > (dur - 10) * 60 * 1000;
+
           return (
-            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${started && !finished ? " live" : ""}`}>
+            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${running ? " live" : ""}${overtime ? " overtime" : ""}`}>
               <div className="cc-head">
                 <b>{c.start}</b>
-                {started && !finished ? <span className="badge live-badge">● In progress</span>
-                  : finished ? <span className="badge closed">Ended</span>
-                  : <span className={`badge${full ? " full" : closed ? " closed" : " open"}`}>
-                      {closed ? "Closed" : full ? "FULL" : left === 1 ? "1 spot left" : `${left} spots left`}
-                    </span>}
+                {running
+                  ? <span className={`badge ${overtime ? "over-badge" : "live-badge"}`}>{overtime ? "● OVERTIME" : "● Running"}</span>
+                  : <span className="muted cc-plan">{cohortDone}/{list.length || cap} done</span>}
               </div>
-              <div className="cc-bar"><i style={{ width: `${capPct}%` }} /></div>
-              <div className="cc-count">{list.length} / {cap} candidates{list.length > 0 ? ` · ${past} past behavioral` : ""}</div>
+
+              {/* cohort timer */}
+              <div className="timer-row">
+                <div className={`timer-clock${overtime ? " over" : nearEnd ? " near" : ""}`}>
+                  {running ? fmtElapsed(elapsedMs) : "0:00"} <span className="timer-plan">/ {dur}:00</span>
+                </div>
+                {running
+                  ? <button className="timer-btn reset" onClick={() => resetTimer(c.id)}>Reset</button>
+                  : <button className="timer-btn start" onClick={() => startTimer(c.id)}>▶ Start</button>}
+              </div>
+              {overtime && <div className="over-alert">Over planned time by {fmtElapsed(elapsedMs - dur * 60 * 1000)}</div>}
+
+              {/* cohort progress */}
+              <div className="cc-bar"><i style={{ width: `${cohortPct}%` }} /></div>
+              <div className="cc-count">{list.length} / {cap} candidates · {cohortDone} completed</div>
+
+              {/* per-candidate mini progress */}
               <div className="cc-list">
                 {list.length === 0 ? <span className="muted">No candidates yet</span> :
-                  list.map((cd) => (
-                    <span key={cd.id} className="cc-name">
-                      <span className={`dot s-${cd.status.replace(/\s+/g, "").toLowerCase()}`} />{cd.name}
-                    </span>
-                  ))}
+                  list.map((cd) => {
+                    const si = stageIndex(cd.status);
+                    return (
+                      <div key={cd.id} className="cand-prog">
+                        <span className="cand-name">{cd.name}</span>
+                        {si === -1
+                          ? <span className="cand-noshow">No show</span>
+                          : <span className="stage-dots">
+                              {["Behavioral", "Transition", "Case"].map((lbl, i) => (
+                                <span key={lbl} className={`stg${si > i ? " fill" : ""}${si === i + 1 ? " active" : ""}`} title={lbl} />
+                              ))}
+                              {si === 3 && <span className="stg-done">✓</span>}
+                            </span>}
+                      </div>
+                    );
+                  })}
               </div>
             </div>
           );
         })}
       </div>
-      <p className="fine" style={{ marginTop: 16 }}>Update each candidate's status in the <b>Interview Day</b> tab — this dashboard reflects it live.</p>
+      <p className="fine" style={{ marginTop: 16 }}>Start a cohort's timer when its interviews begin — it alerts if you pass {dur} minutes. Update each candidate's status in the <b>Interview Day</b> tab; progress here reflects it live.</p>
     </div>
   );
 }
@@ -1464,10 +1616,14 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
     startTime: d.startTime, endTime: d.endTime,
     behavioralMin: d.behavioralMin, bufferMin: d.bufferMin, caseMin: d.caseMin,
     candidatesPerCohort: d.candidatesPerCohort, cohortIntervalMin: d.cohortIntervalMin,
-    firstDate: "",
   });
+  const [dates, setDates] = useState([]);
+  const [dateInput, setDateInput] = useState("");
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const events = data.interviewEvents || [];
+  const addDate = () => { if (dateInput && !dates.includes(dateInput)) { setDates([...dates, dateInput].sort()); setDateInput(""); } };
+  const rmDate = (d) => setDates(dates.filter((x) => x !== d));
+  const [confirmDel, setConfirmDel] = useState(null);
 
   const preview = useMemo(() => {
     try { return cohortTimes({ ...f, behavioralMin: +f.behavioralMin, bufferMin: +f.bufferMin, caseMin: +f.caseMin, cohortIntervalMin: +f.cohortIntervalMin }); }
@@ -1479,7 +1635,7 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
     const ev = {
       id: `EV-${Date.now().toString(36).toUpperCase()}`,
       name: f.name.trim(),
-      dates: f.firstDate ? [f.firstDate] : [],
+      dates: [...dates].sort(),
       location: { building: f.building.trim(), room: f.room.trim(), address: f.address.trim(), notes: "" },
       startTime: f.startTime, endTime: f.endTime,
       behavioralMin: +f.behavioralMin, bufferMin: +f.bufferMin, caseMin: +f.caseMin,
@@ -1488,7 +1644,7 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
     };
     await save((prev) => ({ ...prev, interviewEvents: [...(prev.interviewEvents || []), ev] }));
     setActiveEventId(ev.id);
-    setF({ ...f, name: "", firstDate: "" });
+    setF({ ...f, name: "" }); setDates([]);
   };
 
   const removeEvent = async (id) =>
@@ -1500,9 +1656,16 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
       <div className="card form-card" style={{ maxWidth: 720 }}>
         <h3 className="step-h" style={{ marginTop: 0 }}>Create an interview event</h3>
         <p className="muted" style={{ marginTop: -6, marginBottom: 16 }}>Set the location, format, and time window once. You then add as many interview <b>dates</b> as you want to this event — no need to re-enter anything. Reuse it all semester.</p>
-        <div className="field-row">
-          <Field label="Event name" value={f.name} onChange={set("name")} placeholder="Fall 2026 Consultant Interviews" />
-          <Field label="First interview date (optional)" type="date" value={f.firstDate} onChange={set("firstDate")} />
+        <Field label="Event name" value={f.name} onChange={set("name")} placeholder="Fall 2026 Consultant Interviews" />
+        <label className="field"><span>Interview dates — add one or more</span>
+          <div className="date-add-row">
+            <input type="date" className="date-add-input" value={dateInput} onChange={(e) => setDateInput(e.target.value)} />
+            <Btn small type="button" onClick={addDate} disabled={!dateInput}>+ Add date</Btn>
+          </div>
+        </label>
+        <div className="date-chip-row" style={{ marginBottom: 14 }}>
+          {dates.length === 0 ? <span className="muted">No dates added yet — you can also add them later in Settings.</span> :
+            dates.map((d) => <span key={d} className="date-chip">{prettyDate(d)}<button type="button" onClick={() => rmDate(d)} title="Remove">×</button></span>)}
         </div>
         <div className="field-row">
           <Field label="Building" value={f.building} onChange={set("building")} placeholder="Rawls Hall" />
@@ -1524,21 +1687,32 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
           <span className="muted">Each date will have <b style={{ color: "var(--green)" }}>{preview.length}</b> cohort{preview.length === 1 ? "" : "s"} ({preview.length * (+f.candidatesPerCohort)} spots/day):</span>
           <div className="prev-pills">{preview.map((c) => <span key={c.id} className="prev-pill">{c.start}</span>)}</div>
         </div>
-        <Btn onClick={create} disabled={!f.name.trim() || preview.length === 0} style={{ marginTop: 8 }}>Create Event</Btn>
+        <Btn onClick={create} disabled={!f.name.trim() || preview.length === 0} style={{ marginTop: 8 }}>Create Event{dates.length ? ` · ${dates.length} date${dates.length === 1 ? "" : "s"}` : ""}</Btn>
       </div>
 
       {events.length > 0 && (
         <div style={{ marginTop: 26 }}>
           <h3 className="step-h">Your events</h3>
-          {events.map((e) => (
-            <div key={e.id} className="card event-row">
-              <div>
-                <b>{e.name}</b>
-                <span className="muted"> · {(e.dates || []).length} date{(e.dates || []).length === 1 ? "" : "s"} · {cohortTimes(e).length} cohorts/day · {(e.location?.building || "TBA")}{e.location?.room ? ` ${e.location.room}` : ""}</span>
+          {events.map((e) => {
+            const candCount = (data.candidates || []).filter((c) => c.eventId === e.id && !c.cancelled).length;
+            return (
+              <div key={e.id} className="card event-row">
+                <div>
+                  <b>{e.name}</b>
+                  <span className="muted"> · {(e.dates || []).length} date{(e.dates || []).length === 1 ? "" : "s"} · {cohortTimes(e).length} cohorts/day · {(e.location?.building || "TBA")}{e.location?.room ? ` ${e.location.room}` : ""}</span>
+                </div>
+                {confirmDel === e.id ? (
+                  <div className="confirm-inline">
+                    <span className="confirm-q">Delete this event{candCount ? ` and ${candCount} booking${candCount === 1 ? "" : "s"}` : ""}?</span>
+                    <Btn kind="danger" small onClick={() => { removeEvent(e.id); setConfirmDel(null); }}>Yes, delete</Btn>
+                    <Btn kind="outline" small onClick={() => setConfirmDel(null)}>Keep</Btn>
+                  </div>
+                ) : (
+                  <Btn kind="danger" small onClick={() => setConfirmDel(e.id)}>Delete</Btn>
+                )}
               </div>
-              <Btn kind="danger" small onClick={() => removeEvent(e.id)}>Delete</Btn>
-            </div>
-          ))}
+            );
+          })}
           <p className="muted" style={{ marginTop: 6 }}>Add or remove interview dates for an event in the <b>Settings</b> tab.</p>
         </div>
       )}
@@ -1566,11 +1740,11 @@ function IACandidates({ data, save, ev }) {
     save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === id ? { ...c, cancelled: true } : c) }));
 
   const exportCsv = () => {
-    const head = ["Name", "Email", "Purdue ID", "Phone", "Major", "Grad Year", "Date", "Cohort Start", "Approx End", "Location", "Status", "Confirmation"];
+    const head = ["Name", "Email", "Purdue ID", "Phone", "Date", "Cohort Start", "Approx End", "Location", "Status", "Confirmation"];
     const loc = ev.location || {};
     const rowsCsv = filtered.map((c) => {
       const co = cohortTimes(ev).find((k) => k.id === c.cohortId);
-      return [c.name, c.email, c.purdueId, c.phone, c.major, c.gradYear, prettyDate(c.date),
+      return [c.name, c.email, c.purdueId, c.phone, prettyDate(c.date),
         co?.start || "", co ? addMin(co.start, cohortDuration(ev)) : "",
         [loc.building, loc.room].filter(Boolean).join(" "), c.status, c.id];
     });
@@ -1743,7 +1917,10 @@ function IASettings({ data, save, ev, date }) {
         <div className="date-chip-row">
           {eventDates(ev).length === 0 ? <span className="muted">No dates yet.</span> :
             eventDates(ev).map((d) => (
-              <span key={d} className="date-chip">{prettyDate(d)}<button onClick={() => removeDate(d)} title="Remove date">×</button></span>
+              <span key={d} className="date-chip">{prettyDate(d)}<button onClick={() => {
+                  const n = (data.candidates || []).filter((c) => c.eventId === ev.id && c.date === d && !c.cancelled).length;
+                  if (window.confirm(`Remove ${prettyDate(d)}${n ? ` and its ${n} booking${n === 1 ? "" : "s"}` : ""}?`)) removeDate(d);
+                }} title="Remove date">×</button></span>
             ))}
         </div>
       </div>
@@ -2280,6 +2457,40 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .dot.s-completed { background: #1E7E34; }
 .dot.s-noshow { background: #C0392B; }
 @media (max-width: 720px) { .progress-facts { grid-template-columns: repeat(2, auto); } }
+
+
+/* ============ dashboard v2: timers + 2-level progress ============ */
+.day-summary { display: flex; gap: 20px; font-size: 13.5px; color: #555; }
+.day-summary b { font-family: 'Space Grotesk', sans-serif; color: #111; font-size: 16px; margin-right: 3px; }
+.cc-plan { font-size: 12.5px; font-weight: 600; }
+.timer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 6px;
+  padding: 8px 12px; border-radius: 10px; background: #FAFAF7; border: 1px solid #EDEDEA; }
+.timer-clock { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 18px; color: #333; font-variant-numeric: tabular-nums; }
+.timer-clock.near { color: #B8860B; }
+.timer-clock.over { color: #C0392B; }
+.timer-plan { font-size: 12px; color: #AAA; font-weight: 600; }
+.timer-btn { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 12.5px; padding: 7px 14px;
+  border-radius: 999px; border: none; cursor: pointer; transition: all .2s; }
+.timer-btn.start { background: var(--green); color: #fff; }
+.timer-btn.start:hover { background: var(--greenDark); }
+.timer-btn.reset { background: #fff; border: 1.5px solid #D8D8D3; color: #666; }
+.timer-btn.reset:hover { border-color: #C0392B; color: #C0392B; }
+.cohort-card.overtime { border-color: #C0392B; box-shadow: 0 8px 22px rgba(192,57,43,.15); }
+.over-badge { background: #C0392B; color: #fff; animation: pulse 1s ease-in-out infinite; }
+.over-alert { font-size: 12.5px; font-weight: 700; color: #C0392B; margin-bottom: 8px; }
+.cand-prog { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; border-top: 1px solid #F2F2EE; }
+.cand-prog:first-child { border-top: none; }
+.cand-name { font-size: 13.5px; color: #333; }
+.stage-dots { display: flex; align-items: center; gap: 5px; }
+.stg { width: 22px; height: 5px; border-radius: 3px; background: #E4E4DF; transition: background .3s; }
+.stg.fill { background: var(--green); }
+.stg.active { background: #E0A800; animation: pulse 1.5s ease-in-out infinite; }
+.stg-done { color: var(--green); font-weight: 800; font-size: 13px; margin-left: 2px; }
+.cand-noshow { font-size: 12px; font-weight: 700; color: #C0392B; }
+.confirm-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.confirm-q { font-size: 13px; font-weight: 600; color: #C0392B; }
+.manage-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.check.gray { background: #999; }
 
     `}</style>
   );
