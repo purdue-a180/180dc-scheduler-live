@@ -28,8 +28,8 @@ const CONFIG = {
   primaryGreenDark: "#618E2A",
   primaryGreenTint: "#F2F8E9",
   clubEmail: "purdue@180dc.org",
-  instagram: "https://instagram.com/180dcpurdue",
-  linkedin: "https://linkedin.com/company/180-degrees-consulting-purdue",
+  instagram: "https://www.instagram.com/purdue180dc/",
+  linkedin: "https://www.linkedin.com/company/180-degrees-consulting-purdue/posts/?feedView=all",
   homeHeading: "Schedule Your 180 Degrees Purdue Retention Feedback Call",
   homeDescription:
     "Select an available time for your 180 Degrees Purdue retention feedback call. Once your booking is confirmed, an available interviewer will automatically be assigned to you.",
@@ -1102,9 +1102,26 @@ function InterviewBooking({ data, onBook, go }) {
 
   const dates = ev ? openDates(data, ev) : [];
   const cohort = ev && cohortId ? cohortTimes(ev).find((c) => c.id === cohortId) : null;
-  const detailsValid = form.name.trim() && /^\S+@\S+\.\S+$/.test(form.email) && form.purdueId.trim();
+  const puidValid = /^\d{10}$/.test(form.purdueId.trim());
+  const detailsValid = form.name.trim() && /^\S+@\S+\.\S+$/.test(form.email) && puidValid;
 
-  const next = () => { setError(""); setDir(1); setStep((s) => Math.min(4, s + 1)); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  const existingBooking = () => {
+    const email = form.email.trim().toLowerCase();
+    const pid = form.purdueId.trim().toLowerCase();
+    return (data.candidates || []).find((c) => c.eventId === ev.id && !c.cancelled &&
+      (c.email.trim().toLowerCase() === email || (pid && c.purdueId.trim().toLowerCase() === pid)));
+  };
+  const next = () => {
+    setError("");
+    if (step === 1) {
+      const dup = existingBooking();
+      if (dup) {
+        const dc = cohortTimes(ev).find((c) => c.id === dup.cohortId);
+        return setError(`You already have an interview booked on ${prettyDate(dup.date)} at ${dc ? dc.start : ""}. Check your confirmation email to change it.`);
+      }
+    }
+    setDir(1); setStep((s) => Math.min(4, s + 1)); window.scrollTo({ top: 0, behavior: "smooth" });
+  };
   const back = () => { setError(""); setDir(-1); if (step === 1) { go("home"); } else { setStep((s) => s - 1); } window.scrollTo({ top: 0, behavior: "smooth" }); };
 
   const submit = async () => {
@@ -1156,7 +1173,10 @@ function InterviewBooking({ data, onBook, go }) {
             <p className="muted" style={{ marginTop: -6, marginBottom: 16 }}>Just the essentials — we already have your application on file.</p>
             <Field label="Full name" value={form.name} onChange={set("name")} placeholder="Boiler Maker" autoComplete="name" />
             <Field label="Purdue email" type="email" value={form.email} onChange={set("email")} placeholder="you@purdue.edu" autoComplete="email" />
-            <Field label="Purdue ID" value={form.purdueId} onChange={set("purdueId")} placeholder="0012345678" />
+            <Field label="Purdue ID (10 digits)" value={form.purdueId}
+              onChange={(e) => setForm({ ...form, purdueId: e.target.value.replace(/\D/g, "").slice(0, 10) })}
+              inputMode="numeric" placeholder="0012345678" />
+            {form.purdueId && !puidValid && <p className="err" style={{ marginTop: -8 }}>Purdue ID must be exactly 10 digits.</p>}
             <Field label="Phone (optional)" value={form.phone} onChange={set("phone")} placeholder="(765) 555-0123" />
             {error && <p className="err">{error}</p>}
           </div>
@@ -1207,10 +1227,11 @@ function InterviewBooking({ data, onBook, go }) {
               <div className="d-row"><span>Name</span><b>{form.name}</b></div>
               <div className="d-row"><span>Date</span><b>{prettyDate(date)}</b></div>
               <div className="d-row"><span>Arrival time</span><b>{cohort.start}</b></div>
+              <div className="d-row"><span>Interview start</span><b>{cohort.start}</b></div>
               <div className="d-row"><span>Location</span><b>{[loc.building, loc.room && `Room ${loc.room}`].filter(Boolean).join(", ") || "TBA"}</b></div>
               <div className="d-row"><span>Format</span><b>15-min behavioral · 5-min transition · 45-min case</b></div>
             </div>
-            <p className="fine" style={{ marginTop: 14 }}>{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
+            <p className="arrival-warn" style={{ marginTop: 14 }}>{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
             {error && <p className="err">{error}</p>}
           </div>
         </div>
@@ -1377,7 +1398,7 @@ function CandidateConfirmation({ info, emailStatus, go }) {
         <div className="fmt-step"><b>45 min</b><span>Case Interview</span></div>
       </div>
 
-      <p className="arrival-note rise d4">{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
+      <p className="arrival-warn rise d4">{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
 
       <p className="fine rise d5">
         {emailStatus === "sent" ? (
@@ -1527,8 +1548,44 @@ function IADashboard({ data, save, ev, date }) {
   const now = Date.now();
   const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 
+  /* ----- NIGHT STATUS: wall clock vs scheduled cohort times -----
+     For each cohort with candidates, its last candidate should be DONE by
+     (cohortStart + 65 min). If a cohort isn't fully complete and that time
+     has passed, we're behind by (now - expectedEnd). We report the largest
+     such lag across cohorts, and also flag if a cohort should have STARTED. */
+  const nowD = new Date();
+  const isToday = date === nowD.toISOString().slice(0, 10);
+  const nowMinOfDay = nowD.getHours() * 60 + nowD.getMinutes();
+  let behindMin = 0, nextCohort = null, statusNote = "";
+  if (isToday) {
+    cohorts.forEach((c) => {
+      const list = candidatesInCohort(data, ev.id, date, c.id);
+      if (list.length === 0) return;
+      const allDone = list.every((x) => x.status === "Completed" || x.status === "No Show");
+      const expectedEnd = c.startMin + dur;
+      if (!allDone && nowMinOfDay > expectedEnd) behindMin = Math.max(behindMin, nowMinOfDay - expectedEnd);
+      /* next cohort that hasn't started / completed */
+      if (!allDone && !nextCohort && nowMinOfDay < c.startMin + 5) nextCohort = c;
+    });
+  }
+  const dayHasCands = dayCandidates.length > 0;
+  let nightStatus = null;
+  if (isToday && dayHasCands) {
+    if (doneCount === scheduled) nightStatus = { cls: "ontime", big: "All interviews complete", sub: "Great work tonight." };
+    else if (behindMin >= 15) nightStatus = { cls: "behind", big: `Running ${behindMin} min behind`, sub: "A cohort is past its planned end time." };
+    else if (behindMin >= 3) nightStatus = { cls: "slight", big: `Running ${behindMin} min behind`, sub: "Slightly over — keep an eye on the clock." };
+    else nightStatus = { cls: "ontime", big: "On schedule", sub: nextCohort ? `Next up: ${nextCohort.start} cohort` : "Interviews in progress." };
+  }
+
   return (
     <div className="fadein">
+      {nightStatus && (
+        <div className={`night-status ${nightStatus.cls}`}>
+          <div className="ns-pulse" />
+          <div className="ns-text"><b>{nightStatus.big}</b><span>{nightStatus.sub}</span></div>
+          <div className="ns-clock">{nowD.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}</div>
+        </div>
+      )}
       <div className="day-banner">
         <div>
           <span className="day-banner-date">{prettyDate(date)}</span>
@@ -1562,6 +1619,10 @@ function IADashboard({ data, save, ev, date }) {
                 {running
                   ? <span className={`badge ${overtime ? "over-badge" : "live-badge"}`}>{overtime ? "● OVERTIME" : "● Running"}</span>
                   : <span className="muted cc-plan">{cohortDone}/{list.length || cap} done</span>}
+              </div>
+              <div className="cc-window">Planned {c.start} – {minToClock(c.startMin + dur)}
+                {isToday && list.length > 0 && !list.every((x) => x.status === "Completed" || x.status === "No Show") && nowMinOfDay > c.startMin + dur
+                  && <span className="cc-late"> · {nowMinOfDay - (c.startMin + dur)} min over</span>}
               </div>
 
               {/* cohort timer */}
@@ -2491,6 +2552,29 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .confirm-q { font-size: 13px; font-weight: 600; color: #C0392B; }
 .manage-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .check.gray { background: #999; }
+.arrival-warn { color: #C0392B; font-weight: 700; font-size: 14px; text-align: center; max-width: 480px; margin-left: auto; margin-right: auto; }
+.confirm-review + .arrival-warn { text-align: left; margin-left: 0; }
+
+
+/* ============ night status banner ============ */
+.night-status { display: flex; align-items: center; gap: 16px; padding: 18px 22px; border-radius: 16px; margin-bottom: 20px;
+  border: 1.5px solid; position: relative; overflow: hidden; }
+.night-status.ontime { background: linear-gradient(180deg, #F1F9EA, #E8F4DA); border-color: #A9CF7E; }
+.night-status.slight { background: linear-gradient(180deg, #FFF8E8, #FFF1D4); border-color: #EBC97A; }
+.night-status.behind { background: linear-gradient(180deg, #FDEEEC, #FBE0DC); border-color: #E8A79E; }
+.ns-pulse { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; animation: pulse 1.6s ease-in-out infinite; }
+.night-status.ontime .ns-pulse { background: #4CAF50; }
+.night-status.slight .ns-pulse { background: #E0A800; }
+.night-status.behind .ns-pulse { background: #C0392B; }
+.ns-text { display: flex; flex-direction: column; }
+.ns-text b { font-family: 'Space Grotesk', sans-serif; font-size: 20px; line-height: 1.1; }
+.night-status.ontime .ns-text b { color: #1E7E34; }
+.night-status.slight .ns-text b { color: #7A5B00; }
+.night-status.behind .ns-text b { color: #C0392B; }
+.ns-text span { font-size: 13px; color: #555; margin-top: 2px; }
+.ns-clock { margin-left: auto; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; color: #333; font-variant-numeric: tabular-nums; }
+.cc-window { font-size: 12px; color: #999; font-weight: 600; margin: -4px 0 8px; font-family: 'Space Grotesk', sans-serif; }
+.cc-late { color: #C0392B; }
 
     `}</style>
   );
