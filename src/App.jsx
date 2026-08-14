@@ -23,7 +23,7 @@ const LOGO_URL =
 const LOGO_FALLBACK = "data:image/png;base64,__LIGHT_B64__";
 
 const CONFIG = {
-  siteName: "180 Degrees Purdue Scheduling Website",
+  siteName: "The Scheduler · 180DC Purdue",
   primaryGreen: "#76A935",
   primaryGreenDark: "#618E2A",
   primaryGreenTint: "#F2F8E9",
@@ -68,7 +68,7 @@ const CONFIG = {
      PROSPECTIVE-CONSULTANT INTERVIEW ADMIN
      Demo credentials only — CHANGE before production.
      ============================================================ */
-  interviewAdmin: { username: "180DC", password: "41234" },
+  interviewAdmin: { username: "180DC", password: "rishiisgreat" },
 
   /* Defaults used when creating a new interview event */
   interviewDefaults: {
@@ -413,6 +413,8 @@ export default function App() {
 
   useEffect(() => { document.title = CONFIG.siteName; }, []);
   const [manageId, setManageId] = useState(null);
+  const [dark, setDark] = useState(() => { try { return localStorage.getItem("180dc-dark") === "1"; } catch { return false; } });
+  useEffect(() => { try { localStorage.setItem("180dc-dark", dark ? "1" : "0"); } catch {} }, [dark]);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const m = params.get("manage");
@@ -539,9 +541,9 @@ export default function App() {
   };
 
   return (
-    <div className="site" style={{ "--green": CONFIG.primaryGreen, "--greenDark": CONFIG.primaryGreenDark, "--tint": CONFIG.primaryGreenTint }}>
+    <div className={`site${dark ? " dark" : ""}`} style={{ "--green": CONFIG.primaryGreen, "--greenDark": CONFIG.primaryGreenDark, "--tint": CONFIG.primaryGreenTint }}>
       <GlobalStyles />
-      <Header page={page} go={go} />
+      <Header page={page} go={go} dark={dark} setDark={setDark} />
       <main className="wrap">
         {!loaded ? (
           <p className="loading">Loading…</p>
@@ -575,7 +577,7 @@ export default function App() {
 }
 
 /* ---------------- Header ---------------- */
-function Header({ page, go }) {
+function Header({ page, go, dark, setDark }) {
   const memberSide = page === "book" || page === "confirm" || page === "team";
   const ivSide = page === "interview" || page === "iv-confirm" || page === "iv-admin";
   return (
@@ -585,6 +587,9 @@ function Header({ page, go }) {
           <Logo h={48} />
         </button>
         <nav>
+          <button className="dark-toggle" onClick={() => setDark((d) => !d)} aria-label="Toggle dark mode" title={dark ? "Light mode" : "Dark mode"}>
+            {dark ? "☀" : "☾"}
+          </button>
           {page !== "home" && (
             <button className="nav-lnk back" onClick={() => go("home")}>← Back to Home</button>
           )}
@@ -604,24 +609,26 @@ function Header({ page, go }) {
 function Landing({ go }) {
   return (
     <section className="page landing">
-      <p className="eyebrow rise d1">180 Degrees Purdue Scheduling</p>
-      <h1 className="landing-h rise d2">One place for member conversations<br/>and consultant interviews.</h1>
-      <p className="lede rise d3" style={{ maxWidth: 620 }}>
-        Choose the option that fits you. Current members schedule internal calls; prospective consultants
-        invited to interview book their in-person session.
+      <p className="eyebrow rise d1">180 Degrees Consulting · Purdue</p>
+      <h1 className="landing-h">
+        <span className="ln"><i className="rise d2">The</i> <i className="rise d3 grn">Scheduler.</i></span>
+      </h1>
+      <p className="lede rise d4" style={{ maxWidth: 620 }}>
+        Book your consultant interview or member call — all in one place. Current members schedule internal
+        calls; prospective consultants invited to interview book their in-person session.
       </p>
-      <div className="choice-grid rise d4">
+      <div className="choice-grid rise d5">
         <button className="choice-card" onClick={() => go("interview")}>
-          <span className="choice-tag">Prospective Consultants</span>
+          <div className="choice-top"><span className="choice-tag">Prospective Consultants</span><span className="choice-num">01</span></div>
           <span className="choice-title">Schedule Your Interview</span>
           <span className="choice-desc">In-person 180DC Purdue consultant interview</span>
-          <span className="choice-go">Interview Scheduling →</span>
+          <span className="choice-go">Interview Scheduling <span className="arw">→</span></span>
         </button>
         <button className="choice-card alt" onClick={() => go("book")}>
-          <span className="choice-tag">180DC Members</span>
+          <div className="choice-top"><span className="choice-tag">180DC Members</span><span className="choice-num">02</span></div>
           <span className="choice-title">Schedule a Member Call</span>
           <span className="choice-desc">Retention · Feedback · Check-ins · Internal conversations</span>
-          <span className="choice-go">Member Scheduling →</span>
+          <span className="choice-go">Member Scheduling <span className="arw">→</span></span>
         </button>
       </div>
     </section>
@@ -1523,77 +1530,106 @@ function IADashboard({ data, save, ev, date }) {
   if (!date) return <div className="empty-state fadein"><p>This event has no interview dates yet.</p><p className="muted">Add dates in <b>Settings</b>.</p></div>;
 
   const cohorts = cohortTimes(ev);
-  const dur = cohortDuration(ev); // 65 min planned
+  const dur = cohortDuration(ev); // planned minutes per cohort (e.g. 65)
   const totalCap = cohorts.reduce((n, c) => n + cohortCapacity(ev, date, c.id), 0);
   const dayCandidates = cohorts.flatMap((c) => candidatesInCohort(data, ev.id, date, c.id));
   const scheduled = dayCandidates.length;
   const doneCount = dayCandidates.filter((c) => c.status === "Completed").length;
 
-  /* per-candidate progress: which of the 3 stages they've reached */
   const stageIndex = (status) => {
     if (status === "Completed") return 3;
     if (status === "Case Interview") return 2;
-    if (status === "Waiting") return 2;         // between behavioral and case
+    if (status === "Waiting") return 2;
     if (status === "Behavioral" || status === "Checked In") return 1;
     if (status === "No Show") return -1;
-    return 0;                                    // Not Arrived
+    return 0;
   };
 
-  /* timers live in data.interviewTimers["<eventId>|<date>|<cohortId>"] = startMs */
   const timerKey = (cid) => `${ev.id}|${date}|${cid}`;
   const timers = data.interviewTimers || {};
   const startTimer = (cid) => save((prev) => ({ ...prev, interviewTimers: { ...(prev.interviewTimers || {}), [timerKey(cid)]: Date.now() } }));
   const resetTimer = (cid) => save((prev) => { const t = { ...(prev.interviewTimers || {}) }; delete t[timerKey(cid)]; return { ...prev, interviewTimers: t }; });
+  const completeTimer = (cid) => save((prev) => ({ ...prev, interviewTimers: { ...(prev.interviewTimers || {}), [timerKey(cid) + "|done"]: Date.now() } }));
 
   const now = Date.now();
-  const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
-
-  /* ----- NIGHT STATUS: wall clock vs scheduled cohort times -----
-     For each cohort with candidates, its last candidate should be DONE by
-     (cohortStart + 65 min). If a cohort isn't fully complete and that time
-     has passed, we're behind by (now - expectedEnd). We report the largest
-     such lag across cohorts, and also flag if a cohort should have STARTED. */
   const nowD = new Date();
   const isToday = date === nowD.toISOString().slice(0, 10);
-  const nowMinOfDay = nowD.getHours() * 60 + nowD.getMinutes();
-  let behindMin = 0, nextCohort = null, statusNote = "";
-  if (isToday) {
-    cohorts.forEach((c) => {
-      const list = candidatesInCohort(data, ev.id, date, c.id);
-      if (list.length === 0) return;
-      const allDone = list.every((x) => x.status === "Completed" || x.status === "No Show");
-      const expectedEnd = c.startMin + dur;
-      if (!allDone && nowMinOfDay > expectedEnd) behindMin = Math.max(behindMin, nowMinOfDay - expectedEnd);
-      /* next cohort that hasn't started / completed */
-      if (!allDone && !nextCohort && nowMinOfDay < c.startMin + 5) nextCohort = c;
-    });
-  }
+  const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  const fmtClock = (min) => { const h = Math.floor(min / 60), m = Math.round(min % 60); const ap = h >= 12 ? "PM" : "AM"; const h12 = ((h + 11) % 12) + 1; return `${h12}:${String(m).padStart(2, "0")} ${ap}`; };
+
+  /* ---------- SEQUENTIAL PROJECTION MODEL ----------
+     Cohorts run one at a time. Each cohort's projected start is:
+       - if it has a Start timestamp: that real time
+       - else: the previous cohort's projected END (cascade), or its scheduled time (first cohort)
+     Projected end = projected start + planned duration, BUT if a cohort is currently
+     running and has already exceeded the plan, use the actual elapsed instead.
+     The delay of the whole night = projected finish - scheduled finish. */
+  const schedFinishMin = cohorts.length ? cohorts[cohorts.length - 1].startMin + dur : 0;
+  const startMsOf = (cid) => timers[timerKey(cid)];
+  const doneMsOf = (cid) => timers[timerKey(cid) + "|done"];
+  const msToMinOfDay = (ms) => { const d = new Date(ms); return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60; };
+
+  let cursor = null;         // running projected-end (min of day) of the previous cohort
+  let worstOverCohort = null, worstOver = 0;
+  let currentCohort = null;  // the one running now
+  const proj = {};           // cohortId -> { startMin, endMin, actualStart, running, over }
+  cohorts.forEach((c, idx) => {
+    const list = candidatesInCohort(data, ev.id, date, c.id);
+    const sMs = startMsOf(c.id), dMs = doneMsOf(c.id);
+    const running = !!sMs && !dMs;
+    if (running) currentCohort = c;
+
+    let startMin;
+    if (sMs) startMin = msToMinOfDay(sMs);
+    else if (cursor != null) startMin = Math.max(cursor, c.startMin); // cascade but never before scheduled
+    else startMin = c.startMin;
+
+    let lengthMin = dur;
+    if (sMs && dMs) lengthMin = Math.max(1, (dMs - sMs) / 60000);        // finished: actual length
+    else if (running) lengthMin = Math.max(dur, (now - sMs) / 60000);   // running over: use elapsed
+
+    const endMin = startMin + lengthMin;
+    const over = Math.round(endMin - (c.startMin + dur)); // vs this cohort's scheduled end
+    if (over > worstOver && list.length > 0) { worstOver = over; worstOverCohort = c; }
+    proj[c.id] = { startMin, endMin, running, over, hasStart: !!sMs, done: !!dMs };
+    cursor = endMin;
+  });
+  const projFinishMin = cursor != null ? cursor : schedFinishMin;
+  const nightDelay = Math.round(projFinishMin - schedFinishMin);
+
+  /* next cohort not yet started */
+  const nextCohort = cohorts.find((c) => !startMsOf(c.id) && candidatesInCohort(data, ev.id, date, c.id).length > 0);
+
   const dayHasCands = dayCandidates.length > 0;
-  let nightStatus = null;
-  if (isToday && dayHasCands) {
-    if (doneCount === scheduled) nightStatus = { cls: "ontime", big: "All interviews complete", sub: "Great work tonight." };
-    else if (behindMin >= 15) nightStatus = { cls: "behind", big: `Running ${behindMin} min behind`, sub: "A cohort is past its planned end time." };
-    else if (behindMin >= 3) nightStatus = { cls: "slight", big: `Running ${behindMin} min behind`, sub: "Slightly over — keep an eye on the clock." };
-    else nightStatus = { cls: "ontime", big: "On schedule", sub: nextCohort ? `Next up: ${nextCohort.start} cohort` : "Interviews in progress." };
+  const allComplete = dayHasCands && doneCount === scheduled;
+  let status = null;
+  if (dayHasCands) {
+    if (allComplete) status = { cls: "ontime", big: "All interviews complete", sub: "Great work tonight." };
+    else if (nightDelay >= 12) status = { cls: "behind", big: `Projected finish ${fmtClock(projFinishMin)}`, sub: `Running ${nightDelay} min over — ${worstOverCohort ? worstOverCohort.start + " cohort ran long" : "cohorts running long"}.` };
+    else if (nightDelay >= 4) status = { cls: "slight", big: `Projected finish ${fmtClock(projFinishMin)}`, sub: `About ${nightDelay} min over plan — keep the pace tight.` };
+    else status = { cls: "ontime", big: `Projected finish ${fmtClock(projFinishMin)}`, sub: nightDelay <= -2 ? `Ahead of plan by ${Math.abs(nightDelay)} min.` : nextCohort ? `On schedule · next up ${nextCohort.start}.` : "On schedule." };
   }
 
   return (
     <div className="fadein">
-      {nightStatus && (
-        <div className={`night-status ${nightStatus.cls}`}>
+      {status && (
+        <div className={`night-status ${status.cls}`}>
           <div className="ns-pulse" />
-          <div className="ns-text"><b>{nightStatus.big}</b><span>{nightStatus.sub}</span></div>
-          <div className="ns-clock">{nowD.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}</div>
+          <div className="ns-text"><b>{status.big}</b><span>{status.sub}</span></div>
+          <div className="ns-right">
+            <div className="ns-clock">{nowD.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}</div>
+            <div className="ns-plan">planned end {fmtClock(schedFinishMin)}</div>
+          </div>
         </div>
       )}
+
       <div className="day-banner">
         <div>
           <span className="day-banner-date">{prettyDate(date)}</span>
           <span className="muted"> · {(ev.location?.building || "")}{ev.location?.room ? ` ${ev.location.room}` : ""}</span>
         </div>
         <div className="day-summary">
-          <span><b>{scheduled}</b> booked</span>
-          <span><b>{doneCount}</b> completed</span>
+          <span><b>{doneCount}</b>/{scheduled} done</span>
           <span><b>{totalCap - scheduled}</b> open</span>
         </div>
       </div>
@@ -1605,42 +1641,46 @@ function IADashboard({ data, save, ev, date }) {
           const closed = cohortClosed(ev, date, c.id);
           const cohortDone = list.filter((x) => x.status === "Completed").length;
           const cohortPct = list.length ? Math.round((cohortDone / list.length) * 100) : 0;
+          const p = proj[c.id] || {};
 
-          const startMs = timers[timerKey(c.id)];
-          const running = !!startMs;
+          const startMs = startMsOf(c.id), dMs = doneMsOf(c.id);
+          const running = !!startMs && !dMs;
           const elapsedMs = running ? now - startMs : 0;
           const overtime = running && elapsedMs > dur * 60 * 1000;
           const nearEnd = running && !overtime && elapsedMs > (dur - 10) * 60 * 1000;
+          const isCurrent = currentCohort && currentCohort.id === c.id;
+          const shifted = !p.hasStart && Math.round(p.startMin) > c.startMin + 1; // projected to start late
 
           return (
-            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${running ? " live" : ""}${overtime ? " overtime" : ""}`}>
+            <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${running ? " live" : ""}${overtime ? " overtime" : ""}${dMs ? " done" : ""}`}>
               <div className="cc-head">
                 <b>{c.start}</b>
-                {running
-                  ? <span className={`badge ${overtime ? "over-badge" : "live-badge"}`}>{overtime ? "● OVERTIME" : "● Running"}</span>
+                {dMs ? <span className="badge closed">✓ Complete</span>
+                  : running ? <span className={`badge ${overtime ? "over-badge" : "live-badge"}`}>{overtime ? "● OVERTIME" : "● Running"}</span>
+                  : shifted ? <span className="badge shift-badge">→ ~{fmtClock(p.startMin)}</span>
                   : <span className="muted cc-plan">{cohortDone}/{list.length || cap} done</span>}
               </div>
               <div className="cc-window">Planned {c.start} – {minToClock(c.startMin + dur)}
-                {isToday && list.length > 0 && !list.every((x) => x.status === "Completed" || x.status === "No Show") && nowMinOfDay > c.startMin + dur
-                  && <span className="cc-late"> · {nowMinOfDay - (c.startMin + dur)} min over</span>}
+                {p.over > 2 && list.length > 0 && <span className="cc-late"> · {p.over} min over</span>}
+                {shifted && list.length > 0 && <span className="cc-shift"> · now ~{fmtClock(p.startMin)}</span>}
               </div>
 
               {/* cohort timer */}
               <div className="timer-row">
                 <div className={`timer-clock${overtime ? " over" : nearEnd ? " near" : ""}`}>
-                  {running ? fmtElapsed(elapsedMs) : "0:00"} <span className="timer-plan">/ {dur}:00</span>
+                  {dMs ? fmtElapsed(dMs - startMs) : running ? fmtElapsed(elapsedMs) : "0:00"} <span className="timer-plan">/ {dur}:00</span>
                 </div>
-                {running
-                  ? <button className="timer-btn reset" onClick={() => resetTimer(c.id)}>Reset</button>
-                  : <button className="timer-btn start" onClick={() => startTimer(c.id)}>▶ Start</button>}
+                <div className="timer-btns">
+                  {!startMs && <button className="timer-btn start" onClick={() => startTimer(c.id)}>▶ Start</button>}
+                  {running && <button className="timer-btn done-btn" onClick={() => completeTimer(c.id)}>✓ Done</button>}
+                  {(startMs || dMs) && <button className="timer-btn reset" onClick={() => resetTimer(c.id)}>Reset</button>}
+                </div>
               </div>
-              {overtime && <div className="over-alert">Over planned time by {fmtElapsed(elapsedMs - dur * 60 * 1000)}</div>}
+              {overtime && <div className="over-alert">Over by {fmtElapsed(elapsedMs - dur * 60 * 1000)} · pushing later cohorts back</div>}
 
-              {/* cohort progress */}
               <div className="cc-bar"><i style={{ width: `${cohortPct}%` }} /></div>
               <div className="cc-count">{list.length} / {cap} candidates · {cohortDone} completed</div>
 
-              {/* per-candidate mini progress */}
               <div className="cc-list">
                 {list.length === 0 ? <span className="muted">No candidates yet</span> :
                   list.map((cd) => {
@@ -1664,10 +1704,11 @@ function IADashboard({ data, save, ev, date }) {
           );
         })}
       </div>
-      <p className="fine" style={{ marginTop: 16 }}>Start a cohort's timer when its interviews begin — it alerts if you pass {dur} minutes. Update each candidate's status in the <b>Interview Day</b> tab; progress here reflects it live.</p>
+      <p className="fine" style={{ marginTop: 16 }}>Hit <b>▶ Start</b> when a cohort begins and <b>✓ Done</b> when it wraps — the projected finish time above updates live and cascades any delay to later cohorts.</p>
     </div>
   );
 }
+
 
 /* ---- Events: create event (settings + first dates), reuse all semester ---- */
 function IAEvents({ data, save, activeEventId, setActiveEventId }) {
@@ -2575,6 +2616,102 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .ns-clock { margin-left: auto; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; color: #333; font-variant-numeric: tabular-nums; }
 .cc-window { font-size: 12px; color: #999; font-weight: 600; margin: -4px 0 8px; font-family: 'Space Grotesk', sans-serif; }
 .cc-late { color: #C0392B; }
+
+
+/* ============ landing refinements ============ */
+.landing .eyebrow { display: inline-flex; align-items: center; gap: 12px; }
+.landing .eyebrow::before { content: ""; width: 30px; height: 2px; background: var(--green); display: inline-block; }
+.landing-h { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(34px, 5.6vw, 58px);
+  line-height: 1.06; letter-spacing: -.024em; margin: 0 0 20px; }
+.landing-h .ln { display: block; overflow: hidden; padding-bottom: 2px; }
+.landing-h .ln i { display: inline-block; font-style: normal; }
+.landing-h .grn { color: var(--green); }
+.choice-top { display: flex; align-items: center; justify-content: space-between; position: relative; z-index: 1; }
+.choice-num { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13px; color: #C4C4BE; transition: color .3s; }
+.choice-card:hover .choice-num { color: var(--green); }
+.choice-go { display: inline-flex; align-items: center; gap: 7px; }
+.choice-go .arw { transition: transform .3s cubic-bezier(.22,1,.36,1); }
+.choice-card:hover .choice-go .arw { transform: translateX(6px); }
+
+
+/* ---- dashboard v3: projection extras ---- */
+.ns-right { margin-left: auto; text-align: right; }
+.ns-plan { font-size: 11px; color: #999; font-weight: 600; margin-top: 2px; }
+.shift-badge { background: #FFF1D4; color: #7A5B00; }
+.timer-btns { display: flex; gap: 6px; }
+.timer-btn.done-btn { background: var(--green); color: #fff; }
+.timer-btn.done-btn:hover { background: var(--greenDark); }
+.cohort-card.done { opacity: .72; }
+.cohort-card.done .cc-head b { color: #888; }
+.cc-shift { color: #B8860B; }
+
+
+/* ================= DARK MODE ================= */
+.dark-toggle { width: 38px; height: 38px; border-radius: 10px; border: 1.5px solid var(--line, #E7E7E2);
+  background: transparent; cursor: pointer; font-size: 16px; line-height: 1; color: inherit;
+  display: inline-flex; align-items: center; justify-content: center; transition: all .2s; margin-right: 4px; }
+.dark-toggle:hover { border-color: var(--green); color: var(--green); }
+
+.site.dark { background: #14160F; color: #E8EAE0; }
+.site.dark .hdr { background: rgba(20,22,15,.85); border-bottom-color: #262922; }
+.site.dark .hdr-in { border-color: #262922; }
+.site.dark .dark-toggle { border-color: #2E322A; color: #E8EAE0; }
+.site.dark .nav-lnk { color: #B6BAAC; }
+.site.dark .nav-lnk:hover, .site.dark .nav-lnk.on { color: var(--green); }
+.site.dark .eyebrow { color: #9ED155; }
+
+/* headings / text */
+.site.dark h1, .site.dark h2, .site.dark h3, .site.dark h4, .site.dark .landing-h,
+.site.dark .choice-title, .site.dark .section-title, .site.dark .day-banner-date { color: #F3F5EC; }
+.site.dark .muted, .site.dark .lede, .site.dark .fine, .site.dark .cc-count, .site.dark .cand-name { color: #9DA294; }
+
+/* surfaces: cards, inputs, boxes */
+.site.dark .card, .site.dark .choice-card, .site.dark .detail-card, .site.dark .event-row,
+.site.dark .team-card, .site.dark .cohort-card, .site.dark .stat-box, .site.dark .panel,
+.site.dark .booking-row, .site.dark .slot-card, .site.dark .avail-card {
+  background: #1C1F16 !important; border-color: #2C3025 !important; }
+.site.dark .choice-card::after { background: linear-gradient(135deg, rgba(118,169,53,.14), transparent 62%); }
+.site.dark .choice-card:hover { border-color: var(--green) !important; box-shadow: 0 18px 44px rgba(0,0,0,.4); }
+
+.site.dark input, .site.dark select, .site.dark textarea,
+.site.dark .field input, .site.dark .date-add-input {
+  background: #14160F !important; border-color: #333829 !important; color: #E8EAE0 !important; }
+.site.dark .field span { color: #9DA294; }
+.site.dark ::placeholder { color: #6B7060; }
+
+/* buttons */
+.site.dark .btn-outline { background: transparent; color: #E8EAE0; border-color: #3A4030; }
+.site.dark .btn-outline:hover { border-color: var(--green); color: var(--green); }
+.site.dark .btn-danger { background: transparent; color: #E8897F; border-color: #5A3833; }
+.site.dark .pill, .site.dark .date-card, .site.dark .time-box { background: #14160F; border-color: #333829; color: #E8EAE0; }
+.site.dark .time-box b { color: #F3F5EC; }
+.site.dark .date-card.is-selected, .site.dark .time-box.is-selected, .site.dark .pill.is-selected { background: var(--green); border-color: var(--green); color: #fff; }
+.site.dark .time-box.is-selected b, .site.dark .time-box.is-selected span { color: #fff; }
+
+/* tabs */
+.site.dark .tab, .site.dark .date-tab { background: #1C1F16; border-color: #2C3025; color: #B6BAAC; }
+.site.dark .tab.on, .site.dark .date-tab.on { background: var(--green); border-color: var(--green); color: #fff; }
+.site.dark .date-tabs-label { color: #9DA294; }
+
+/* dashboard specifics */
+.site.dark .day-banner { background: linear-gradient(180deg, #1C1F16, #191C13); border-color: #2C3025; }
+.site.dark .day-summary { color: #B6BAAC; }
+.site.dark .day-summary b { color: #F3F5EC; }
+.site.dark .timer-row { background: #14160F; border-color: #2C3025; }
+.site.dark .timer-clock { color: #E8EAE0; }
+.site.dark .cc-window { color: #7E8474; }
+.site.dark .cc-bar { background: #2C3025; }
+.site.dark .cand-prog { border-color: #23271D; }
+.site.dark .stg { background: #33382A; }
+.site.dark .night-status.ontime { background: linear-gradient(180deg, #1A2413, #16200F); border-color: #38571F; }
+.site.dark .night-status.slight { background: linear-gradient(180deg, #2A2410, #241F0C); border-color: #5C4E1E; }
+.site.dark .night-status.behind { background: linear-gradient(180deg, #2A1512, #24110E); border-color: #6B2E27; }
+.site.dark .ns-clock { color: #F3F5EC; }
+.site.dark .footer { background: #14160F; border-color: #262922; }
+.site.dark .footer a { color: #9DA294; }
+.site.dark .footer a:hover { color: var(--green); }
+.site.dark .confirm .check { box-shadow: 0 0 0 8px rgba(118,169,53,.12); }
+.site.dark .badge.closed { background: #2C3025; color: #B6BAAC; }
 
     `}</style>
   );
