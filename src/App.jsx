@@ -86,6 +86,21 @@ const CONFIG = {
 
 /* ---------------- helpers ---------------- */
 const iso = (d) => d.toISOString().slice(0, 10);
+const firstName = (full) => (full || "").trim().split(/\s+/)[0] || "there";
+/* rotating encouragement — mix of warm/playful and calm/reassuring, personalized */
+const AFFIRMATIONS = [
+  (n) => `You've got this, ${n}! 💪`,
+  (n) => `Take a breath, ${n} — you're going to do great.`,
+  (n) => `Believe in yourself, ${n}. We're genuinely excited to meet you.`,
+  (n) => `All the best, ${n}! Trust your prep and be yourself.`,
+  (n) => `Deep breath, ${n}. You've already made it this far. 🌱`,
+  (n) => `Rooting for you, ${n}. Walk in like you belong — because you do.`,
+  (n) => `You'll do wonderfully, ${n}. Just be curious and honest.`,
+  (n) => `Nervous is normal, ${n} — it means you care. You've got this.`,
+  (n) => `See you soon, ${n}! Bring your best, and don't overthink it. ✨`,
+  (n) => `We can't wait to hear your thinking, ${n}. Go shine.`,
+];
+const pickAffirmation = (name) => AFFIRMATIONS[Math.floor(Math.random() * AFFIRMATIONS.length)](firstName(name));
 const prettyDate = (s) => {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
@@ -588,7 +603,18 @@ function Header({ page, go, dark, setDark }) {
         </button>
         <nav>
           <button className="dark-toggle" onClick={() => setDark((d) => !d)} aria-label="Toggle dark mode" title={dark ? "Light mode" : "Dark mode"}>
-            {dark ? "☀" : "☾"}
+            {dark ? (
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="12" r="4.5" fill="currentColor" />
+                <g stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <path d="M12 2.5v2.4M12 19.1v2.4M4.6 4.6l1.7 1.7M17.7 17.7l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.6 19.4l1.7-1.7M17.7 6.3l1.7-1.7" />
+                </g>
+              </svg>
+            ) : (
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M20 14.5A8 8 0 1 1 9.5 4a6.3 6.3 0 0 0 10.5 10.5z" fill="currentColor" />
+              </svg>
+            )}
           </button>
           {page !== "home" && (
             <button className="nav-lnk back" onClick={() => go("home")}>← Back to Home</button>
@@ -1105,7 +1131,7 @@ function InterviewBooking({ data, onBook, go }) {
   const [cohortId, setCohortId] = useState(null);
   const [error, setError] = useState("");
   const slideCls = dir === 1 ? "slide-fwd" : "slide-back";
-  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const set = (k) => (e) => { if (error) setError(""); setForm({ ...form, [k]: e.target.value }); };
 
   const dates = ev ? openDates(data, ev) : [];
   const cohort = ev && cohortId ? cohortTimes(ev).find((c) => c.id === cohortId) : null;
@@ -1181,7 +1207,7 @@ function InterviewBooking({ data, onBook, go }) {
             <Field label="Full name" value={form.name} onChange={set("name")} placeholder="Boiler Maker" autoComplete="name" />
             <Field label="Purdue email" type="email" value={form.email} onChange={set("email")} placeholder="you@purdue.edu" autoComplete="email" />
             <Field label="Purdue ID (10 digits)" value={form.purdueId}
-              onChange={(e) => setForm({ ...form, purdueId: e.target.value.replace(/\D/g, "").slice(0, 10) })}
+              onChange={(e) => { if (error) setError(""); setForm({ ...form, purdueId: e.target.value.replace(/\D/g, "").slice(0, 10) }); }}
               inputMode="numeric" placeholder="0012345678" />
             {form.purdueId && !puidValid && <p className="err" style={{ marginTop: -8 }}>Purdue ID must be exactly 10 digits.</p>}
             <Field label="Phone (optional)" value={form.phone} onChange={set("phone")} placeholder="(765) 555-0123" />
@@ -1266,10 +1292,11 @@ function InterviewBooking({ data, onBook, go }) {
 /* ---- Candidate self-service: cancel or reschedule via ?manage=ID link ---- */
 function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
   const cand = (data.candidates || []).find((c) => c.id === manageId);
-  const [mode, setMode] = useState("view");    // view · reschedule · cancelled · done
+  const [mode, setMode] = useState("view");    // view · reschedule · confirmReschedule · confirmCancel · cancelled · done
   const [newDate, setNewDate] = useState(null);
   const [newCohort, setNewCohort] = useState(null);
   const [msg, setMsg] = useState("");
+  const [affirm, setAffirm] = useState("");
 
   if (!cand) {
     return (
@@ -1285,14 +1312,17 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
   const ev = eventById(data, cand.eventId);
   const cohort = ev ? cohortTimes(ev).find((c) => c.id === cand.cohortId) : null;
   const loc = ev?.location || {};
+  const fname = firstName(cand.name);
 
+  /* already cancelled — warm invite to rebook */
   if (cand.cancelled || mode === "cancelled") {
     return (
       <section className="page narrow confirm">
         <div className="check gray"><svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="#fff" strokeWidth="3" strokeLinecap="round" /></svg></div>
-        <h2 className="rise d2">Interview cancelled</h2>
-        <p className="muted rise d2">Your interview has been cancelled and the slot reopened. If this was a mistake, you can book again.</p>
-        <div className="rise d3" style={{ marginTop: 12 }}><Btn onClick={() => go("interview")}>Book a new time →</Btn></div>
+        <h2 className="rise d2">Your interview is cancelled</h2>
+        <p className="muted rise d2">No worries, {fname} — your slot has been reopened. We'd still love to meet you, so feel free to book another time whenever you're ready.</p>
+        <div className="rise d3" style={{ marginTop: 14 }}><Btn onClick={() => go("interview")}>Book a new time →</Btn></div>
+        <div className="rise d3" style={{ marginTop: 10 }}><Btn kind="outline" onClick={() => go("home")}>Back to Home</Btn></div>
       </section>
     );
   }
@@ -1301,17 +1331,20 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
   const doReschedule = async () => {
     if (!newDate || !newCohort) return setMsg("Pick a new date and time.");
     const r = await onReschedule(cand.id, newDate, newCohort);
-    if (!r.ok) return setMsg(r.msg);
+    if (!r.ok) { setMsg(r.msg); setMode("reschedule"); return; }
+    setAffirm(pickAffirmation(cand.name));
     setMode("done");
   };
 
+  /* rescheduled success + affirmation */
   if (mode === "done") {
     const nc = cohortTimes(ev).find((c) => c.id === newCohort);
     return (
       <section className="page narrow confirm">
         <div className="check"><svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg></div>
-        <h2 className="rise d2">Interview rescheduled</h2>
-        <p className="muted rise d2">You're now booked for <b>{prettyDate(newDate)}</b> at <b>{nc?.start}</b>.</p>
+        <h2 className="rise d2">All set, {fname}!</h2>
+        <p className="affirm-inline rise d2">{affirm}</p>
+        <p className="muted rise d2">Your interview is now on <b>{prettyDate(newDate)}</b> at <b>{nc?.start}</b>.</p>
         <div className="rise d3" style={{ marginTop: 12 }}><Btn kind="outline" onClick={() => go("home")}>← Back to Home</Btn></div>
       </section>
     );
@@ -1319,9 +1352,9 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
 
   return (
     <section className="page narrow">
-      <h2 className="rise d1">Manage your interview</h2>
-      <div className="card detail-card rise d2" style={{ marginTop: 12 }}>
-        <div className="d-row"><span>Name</span><b>{cand.name}</b></div>
+      <h2 className="rise d1">Hey {fname}! 👋</h2>
+      <p className="muted rise d1" style={{ marginTop: -6 }}>Here's your interview — you can reschedule it or cancel below.</p>
+      <div className="card detail-card rise d2" style={{ marginTop: 14 }}>
         <div className="d-row"><span>Date</span><b>{prettyDate(cand.date)}</b></div>
         <div className="d-row"><span>Time</span><b>{cohort?.start}</b></div>
         <div className="d-row"><span>Location</span><b>{[loc.building, loc.room && `Room ${loc.room}`].filter(Boolean).join(", ") || "TBA"}</b></div>
@@ -1329,10 +1362,30 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
       </div>
 
       {mode === "view" && (
-        <div className="rise d3 manage-actions">
-          <Btn onClick={() => { setMode("reschedule"); setNewDate(cand.date); }}>Reschedule</Btn>
-          <Btn kind="danger" onClick={doCancel}>Cancel interview</Btn>
-          <Btn kind="outline" onClick={() => go("home")}>Back to Home</Btn>
+        <div className="rise d3 manage-choices">
+          <button className="manage-choice" onClick={() => { setMode("reschedule"); setNewDate(cand.date); setNewCohort(null); }}>
+            <div className="mc-icon">🗓️</div>
+            <div><div className="mc-title">Reschedule</div><div className="mc-sub">Pick a different date or time</div></div>
+            <span className="mc-arw">→</span>
+          </button>
+          <button className="manage-choice danger" onClick={() => setMode("confirmCancel")}>
+            <div className="mc-icon">✕</div>
+            <div><div className="mc-title">Cancel interview</div><div className="mc-sub">Give up your slot entirely</div></div>
+            <span className="mc-arw">→</span>
+          </button>
+          <div style={{ marginTop: 8 }}><Btn kind="outline" onClick={() => go("home")}>Back to Home</Btn></div>
+        </div>
+      )}
+
+      {mode === "confirmCancel" && (
+        <div className="rise d3 confirm-box">
+          <h3 className="cb-title">Cancel your interview?</h3>
+          <p className="muted">This frees your slot for another candidate and can't be undone, {fname}. If you just need a different time, reschedule instead.</p>
+          <div className="manage-actions" style={{ marginTop: 16 }}>
+            <Btn kind="danger" onClick={doCancel}>Yes, cancel it</Btn>
+            <Btn onClick={() => setMode("reschedule")}>Reschedule instead</Btn>
+            <Btn kind="outline" onClick={() => setMode("view")}>Keep my interview</Btn>
+          </div>
         </div>
       )}
 
@@ -1364,64 +1417,92 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
           )}
           {msg && <p className="err">{msg}</p>}
           <div className="manage-actions" style={{ marginTop: 18 }}>
-            <Btn onClick={doReschedule} disabled={!newDate || !newCohort}>Confirm new time</Btn>
+            <Btn onClick={() => { if (!newDate || !newCohort) return setMsg("Pick a new date and time."); setMsg(""); setMode("confirmReschedule"); }} disabled={!newDate || !newCohort}>Review new time →</Btn>
             <Btn kind="outline" onClick={() => { setMode("view"); setMsg(""); }}>Back</Btn>
           </div>
         </div>
       )}
+
+      {mode === "confirmReschedule" && (() => {
+        const nc = cohortTimes(ev).find((c) => c.id === newCohort);
+        return (
+          <div className="rise d3 confirm-box">
+            <h3 className="cb-title">Move your interview?</h3>
+            <div className="reschedule-compare">
+              <div className="rc-col old"><span>From</span><b>{prettyDate(cand.date)}</b><b>{cohort?.start}</b></div>
+              <div className="rc-arrow">→</div>
+              <div className="rc-col new"><span>To</span><b>{prettyDate(newDate)}</b><b>{nc?.start}</b></div>
+            </div>
+            {msg && <p className="err">{msg}</p>}
+            <div className="manage-actions" style={{ marginTop: 16 }}>
+              <Btn onClick={doReschedule}>Confirm new time</Btn>
+              <Btn kind="outline" onClick={() => setMode("reschedule")}>Back</Btn>
+            </div>
+          </div>
+        );
+      })()}
     </section>
   );
 }
 
 function CandidateConfirmation({ info, emailStatus, go }) {
+  const affirm = useMemo(() => info ? pickAffirmation(info.cand.name) : "", [info?.cand?.id]);
   if (!info) return <Landing go={go} />;
   const { cand, ev, cohort, date } = info;
   const loc = ev.location || {};
   const endTime = addMin(cohort.start, cohortDuration(ev));
   const evDate = date || cand.date;
+  const locStr = [loc.building, loc.room && `Room ${loc.room}`, loc.address].filter(Boolean).join(", ") || "TBA";
+
   return (
-    <section className="page confirm">
-      <div className="check"><svg width="30" height="30" viewBox="0 0 24 24" fill="none">
-        <path d="M5 13l4 4L19 7" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-      </svg></div>
-      <h2 className="rise d2">You're booked, {(cand.name || "").split(" ")[0]}!</h2>
-      <p className="muted rise d2" style={{ marginTop: -8 }}>Your 180 Degrees Consulting Purdue interview is scheduled.</p>
+    <section className="page confirm2">
+      <div className="confirm2-inner">
+        <div className="check rise d1"><svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+          <path d="M5 13l4 4L19 7" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        </svg></div>
+        <h2 className="confirm2-h rise d2">You're booked, {firstName(cand.name)}!</h2>
+        <p className="affirm-inline rise d2">{affirm}</p>
+        <p className="confirm2-sub rise d2">Your 180 Degrees Consulting Purdue interview is confirmed.</p>
 
-      <div className="card detail-card rise d3">
-        <div className="d-row"><span>Candidate</span><b>{cand.name}</b></div>
-        <div className="d-row"><span>Date</span><b>{prettyDate(evDate)}</b></div>
-        <div className="d-row"><span>Arrival time</span><b>{cohort.start}</b></div>
-        <div className="d-row"><span>Interview start</span><b>{cohort.start}</b></div>
-        <div className="d-row"><span>Approx. end</span><b>{endTime}</b></div>
-        <div className="d-row"><span>Location</span><b>{[loc.building, loc.room && `Room ${loc.room}`, loc.address].filter(Boolean).join(", ") || "TBA"}</b></div>
-        <div className="d-row"><span>Confirmation #</span><b>{cand.id}</b></div>
+        {/* hero date/time block */}
+        <div className="confirm2-hero rise d3">
+          <div className="ch-date">{prettyDate(evDate)}</div>
+          <div className="ch-time">{cohort.start}</div>
+          <div className="ch-loc">{locStr}</div>
+        </div>
+
+        {/* compact details */}
+        <div className="confirm2-details rise d3">
+          <div className="c2-row"><span>Interview start</span><b>{cohort.start}</b></div>
+          <div className="c2-row"><span>Approx. end</span><b>{endTime}</b></div>
+          <div className="c2-row"><span>Confirmation #</span><b>{cand.id}</b></div>
+        </div>
+
+        {/* format */}
+        <div className="format-card rise d4">
+          <div className="fmt-step"><b>15 min</b><span>Behavioral</span></div>
+          <div className="fmt-arrow">→</div>
+          <div className="fmt-step"><b>5 min</b><span>Transition</span></div>
+          <div className="fmt-arrow">→</div>
+          <div className="fmt-step"><b>45 min</b><span>Case Interview</span></div>
+        </div>
+
+        <p className="arrival-warn rise d4">{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
+
+        <p className="fine rise d5" style={{ textAlign: "center" }}>
+          {emailStatus === "sent" ? (
+            <>A confirmation email has been sent to <b>{cand.email}</b>.</>
+          ) : emailStatus === "pending" ? (
+            <>Sending your confirmation email…</>
+          ) : (
+            <>Please save these details. Questions? Contact <a href={`mailto:${CONFIG.clubEmail}`}>{CONFIG.clubEmail}</a>.</>
+          )}
+        </p>
+        <div className="rise d5"><Btn kind="outline" onClick={() => go("home")}>← Back to Home</Btn></div>
       </div>
-
-      <div className="format-card rise d4">
-        <div className="fmt-step"><b>15 min</b><span>Behavioral Interview</span></div>
-        <div className="fmt-arrow">→</div>
-        <div className="fmt-step"><b>5 min</b><span>Transition</span></div>
-        <div className="fmt-arrow">→</div>
-        <div className="fmt-step"><b>45 min</b><span>Case Interview</span></div>
-      </div>
-
-      <p className="arrival-warn rise d4">{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
-
-      <p className="fine rise d5">
-        {emailStatus === "sent" ? (
-          <>A confirmation email has been sent to <b>{cand.email}</b>.</>
-        ) : emailStatus === "pending" ? (
-          <>Sending your confirmation email…</>
-        ) : (
-          <>Please save these details. Questions? Contact <a href={`mailto:${CONFIG.clubEmail}`}>{CONFIG.clubEmail}</a>.</>
-        )}
-      </p>
-      <div className="rise d5"><Btn kind="outline" onClick={() => go("home")}>← Back to Home</Btn></div>
     </section>
   );
 }
-
-/* ---- Interview admin login ---- */
 function InterviewAdminLogin({ onSuccess }) {
   const [u, setU] = useState("");
   const [p, setP] = useState("");
@@ -2357,12 +2438,15 @@ tr:hover td { background: #FAFBF7; }
 .choice-title { font-family: 'Space Grotesk', sans-serif; font-size: 25px; color: #111; line-height: 1.15; }
 .choice-desc { font-size: 14.5px; color: #666; }
 .choice-go { margin-top: 12px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: var(--greenDark); }
-.choice-card.alt .choice-tag { color: #111; }
+.choice-card.alt .choice-tag { color: var(--green); }
 
 /* ============ candidate booking ============ */
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.field-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
-.field-row-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.field-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; align-items: end; }
+.field-row-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: end; }
+.field-row-3 .field, .field-row-4 .field { display: flex; flex-direction: column; height: 100%; margin-bottom: 0; }
+.field-row-3 .field span, .field-row-4 .field span { min-height: 30px; display: flex; align-items: flex-end; }
+.field-row-3 .field input, .field-row-4 .field input { margin-top: auto; }
 .iv-event { padding: 18px 20px; margin-bottom: 16px; }
 .iv-event-head { display: flex; justify-content: space-between; margin-bottom: 12px; }
 .iv-event-head b { font-family: 'Space Grotesk', sans-serif; font-size: 16px; }
@@ -2712,6 +2796,96 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .site.dark .footer a:hover { color: var(--green); }
 .site.dark .confirm .check { box-shadow: 0 0 0 8px rgba(118,169,53,.12); }
 .site.dark .badge.closed { background: #2C3025; color: #B6BAAC; }
+
+
+/* ---- affirmations + manage page ---- */
+.affirm-card { position: relative; margin: 18px auto 6px; max-width: 440px; padding: 30px 28px 22px; border-radius: 18px;
+  background: linear-gradient(150deg, #F4FAEC 0%, #E9F4D8 100%); border: 1.5px solid #D3E7AC;
+  text-align: center; overflow: hidden; box-shadow: 0 10px 30px rgba(118,169,53,.14); }
+.affirm-card::before { content: ""; position: absolute; top: -40px; right: -40px; width: 120px; height: 120px;
+  border-radius: 50%; background: radial-gradient(circle, rgba(118,169,53,.16), transparent 70%); pointer-events: none; }
+.affirm-quote { position: absolute; top: 6px; left: 18px; font-family: Georgia, 'Times New Roman', serif;
+  font-size: 64px; line-height: 1; color: var(--green); opacity: .28; pointer-events: none; }
+.affirm-text { position: relative; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 18px;
+  line-height: 1.5; color: #33501A; margin: 0 0 12px; letter-spacing: -.01em; }
+.affirm-label { position: relative; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 11.5px;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--green); opacity: .8; }
+.site.dark .affirm-card { background: linear-gradient(150deg, #1F2C12 0%, #18240E 100%); border-color: #3C5A20; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+.site.dark .affirm-text { color: #C4E89A; }
+.site.dark .affirm-quote { color: #7FB03C; opacity: .35; }
+.site.dark .affirm-label { color: #9ED155; }
+
+/* small, subtle inline affirmation under the heading */
+.affirm-inline { position: relative; font-family: 'Space Grotesk', sans-serif; font-weight: 500; font-style: italic;
+  font-size: 15px; line-height: 1.45; color: var(--greenDark); max-width: 380px; margin: 2px auto 14px;
+  padding: 0 16px; }
+.affirm-inline::before { content: "“"; color: var(--green); opacity: .45; font-family: Georgia, serif; font-size: 15px; margin-right: 1px; }
+.affirm-inline::after { content: "”"; color: var(--green); opacity: .45; font-family: Georgia, serif; font-size: 15px; margin-left: 1px; }
+.site.dark .affirm-inline { color: #B7E081; }
+
+.manage-choices { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+.manage-choice { display: flex; align-items: center; gap: 14px; text-align: left; padding: 18px 20px; border-radius: 14px;
+  border: 1.5px solid var(--line, #E7E7E2); background: #fff; cursor: pointer; transition: all .22s cubic-bezier(.22,1,.36,1); }
+.manage-choice:hover { border-color: var(--green); transform: translateY(-2px); box-shadow: 0 10px 26px rgba(118,169,53,.14); }
+.manage-choice.danger:hover { border-color: #C0392B; box-shadow: 0 10px 26px rgba(192,57,43,.12); }
+.mc-icon { width: 42px; height: 42px; border-radius: 11px; background: var(--tint); display: flex; align-items: center; justify-content: center; font-size: 19px; flex-shrink: 0; }
+.manage-choice.danger .mc-icon { background: #FDECEA; }
+.mc-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 16px; color: #111; }
+.mc-sub { font-size: 13px; color: #888; margin-top: 1px; }
+.mc-arw { margin-left: auto; color: #BBB; font-size: 18px; transition: transform .25s; }
+.manage-choice:hover .mc-arw { transform: translateX(5px); color: var(--green); }
+.manage-choice.danger:hover .mc-arw { color: #C0392B; }
+.site.dark .manage-choice { background: #1C1F16; border-color: #2C3025; }
+.site.dark .mc-title { color: #F3F5EC; }
+.site.dark .mc-icon { background: #14160F; }
+
+.confirm-box { margin-top: 18px; padding: 22px; border-radius: 16px; border: 1.5px solid var(--line, #E7E7E2); background: #FCFDFA; }
+.site.dark .confirm-box { background: #1C1F16; border-color: #2C3025; }
+.cb-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 19px; margin-bottom: 8px; }
+.reschedule-compare { display: flex; align-items: center; gap: 16px; margin: 16px 0 4px; flex-wrap: wrap; }
+.rc-col { flex: 1; min-width: 130px; padding: 14px 16px; border-radius: 12px; border: 1.5px solid var(--line, #E7E7E2); display: flex; flex-direction: column; gap: 3px; }
+.rc-col span { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #999; }
+.rc-col b { font-family: 'Space Grotesk', sans-serif; font-size: 14.5px; }
+.rc-col.old { opacity: .7; }
+.rc-col.new { border-color: var(--green); background: var(--tint); }
+.site.dark .rc-col { background: #14160F; border-color: #2C3025; }
+.site.dark .rc-col.new { background: #1E2A12; border-color: var(--green); }
+.rc-arrow { font-size: 22px; color: var(--green); font-weight: 700; }
+
+
+/* ============ confirmation v2 — centered & cohesive ============ */
+.confirm2 { display: flex; justify-content: center; }
+.confirm2-inner { max-width: 460px; width: 100%; display: flex; flex-direction: column; align-items: center; text-align: center; }
+.confirm2 .check { margin-bottom: 18px; }
+.confirm2-h { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 30px; letter-spacing: -.02em; margin: 0 0 6px; }
+.confirm2-sub { color: #888; font-size: 15px; margin: 0 0 24px; }
+
+.confirm2-hero { width: 100%; border-radius: 18px; padding: 26px 22px; margin-bottom: 14px;
+  background: linear-gradient(160deg, var(--tint), #EAF3DA); border: 1.5px solid #CFE4A9; }
+.ch-date { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px; color: var(--greenDark); letter-spacing: .01em; }
+.ch-time { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 46px; line-height: 1.05; color: #15170F; margin: 2px 0 6px; letter-spacing: -.02em; }
+.ch-loc { font-size: 14px; color: #5a6b3f; font-weight: 600; }
+
+.confirm2-details { width: 100%; border: 1.5px solid var(--line, #E7E7E2); border-radius: 14px; overflow: hidden; margin-bottom: 16px; }
+.c2-row { display: flex; justify-content: space-between; padding: 12px 18px; font-size: 14.5px; }
+.c2-row span { color: #888; }
+.c2-row b { font-family: 'Space Grotesk', sans-serif; font-weight: 600; color: #222; }
+.c2-row:nth-child(even) { background: #FAFAF8; }
+
+.confirm2 .format-card { width: 100%; margin: 0 0 14px; }
+.confirm2 .arrival-warn { margin: 4px auto 16px; }
+.confirm2 .affirm-card { margin: 0 0 18px; width: 100%; }
+.confirm2 .fine { margin: 0 0 18px; }
+
+/* dark mode */
+.site.dark .confirm2-h { color: #F3F5EC; }
+.site.dark .confirm2-hero { background: linear-gradient(160deg, #1E2A12, #17220E); border-color: #3A571F; }
+.site.dark .ch-date { color: #B7E081; }
+.site.dark .ch-time { color: #F3F5EC; }
+.site.dark .ch-loc { color: #9DB87A; }
+.site.dark .confirm2-details { border-color: #2C3025; }
+.site.dark .c2-row:nth-child(even) { background: #191C13; }
+.site.dark .c2-row b { color: #E8EAE0; }
 
     `}</style>
   );
