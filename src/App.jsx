@@ -61,7 +61,7 @@ const CONFIG = {
     templateId: "template_we57qxl",              // member interviewee email
     templateIdInterviewer: "template_10fsu3n",   // member interviewer email
     templateIdCandidate: "template_vvoklll",      // PROSPECTIVE-CONSULTANT email
-    publicKey: "k_yovKbdn3CGIEVL9",
+    publicKey: "yi_V4EsX4rBuPD2yM",
   },
 
   /* ============================================================
