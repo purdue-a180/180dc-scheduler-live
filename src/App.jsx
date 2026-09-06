@@ -57,10 +57,10 @@ const CONFIG = {
   defaultTimes: ["10:00 AM", "11:00 AM", "1:00 PM", "2:00 PM", "3:00 PM", "4:00 PM"],
   bookingWindowDays: 21,
   emailJs: {
-    serviceId: "service_ifxa7sj",
+    serviceId: "service_khi2k9d",
     templateId: "template_we57qxl",              // member interviewee email
     templateIdInterviewer: "template_10fsu3n",   // member interviewer email
-    templateIdCandidate: "template_9dsxr6m",      // PROSPECTIVE-CONSULTANT email
+    templateIdCandidate: "template_vvoklll",      // PROSPECTIVE-CONSULTANT email
     publicKey: "k_yovKbdn3CGIEVL9",
   },
 
