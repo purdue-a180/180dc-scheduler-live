@@ -60,9 +60,27 @@ const CONFIG = {
     serviceId: "service_khi2k9d",
     templateId: "template_we57qxl",              // member interviewee email
     templateIdInterviewer: "template_10fsu3n",   // member interviewer email
-    templateIdCandidate: "template_vvoklll",      // PROSPECTIVE-CONSULTANT email
+    templateIdCandidate: "template_vvoklll",      // PROSPECTIVE-CONSULTANT email (used for both new bookings AND reschedules)
+    templateIdCandidateRescheduled: "",           // optional: a SEPARATE template for reschedules only. Leave blank to
+                                                   // keep reusing templateIdCandidate above (recommended — it already
+                                                   // gets a {{booking_type}} variable of "New booking" or "Rescheduled",
+                                                   // so one template can say the right thing either way). Only fill
+                                                   // this in if you want a genuinely different design/subject/wording
+                                                   // for reschedule emails specifically.
     publicKey: "yi_V4EsX4rBuPD2yM",
   },
+  /* Google Apps Script Web App URL that logs every candidate booking to a Google
+     Sheet (name, email, chosen date/time, etc). Leave blank to disable — booking
+     works fine without it. See the setup instructions above logCandidateToSheet(). */
+  sheetsWebhookUrl: "https://script.google.com/macros/s/AKfycbz7VXrJIpXY0CSSjxqhHub5pbHgqaBg0jDm3744Bdi0TvNJkWjjInW6LdS_5Pftb8_4ZQ/exec",
+  /* Shared secret sent with every logging request and checked by the Apps Script
+     before it appends a row — without this, anyone who found the webhook URL in
+     this site's public JS could POST junk rows into the sheet directly. This is
+     NOT a secure secret in the "never expose it" sense (it ships in public JS
+     same as the URL does) — it just filters out casual/automated spam that isn't
+     coming from this app's own booking flow. Change it any time; just also
+     update the Apps Script's EXPECTED_SECRET to match (see instructions below). */
+  sheetsWebhookSecret: "Uo-RaFW8vhAYDqFW88F-xmjLHHrxlSkB",
   /* Always use this fixed production domain for links sent in emails — NEVER derive it from
      window.location.origin. If a booking happens to be made from a Vercel preview-deployment
      URL (which is SSO-walled and needs a Vercel team login to open), that protected URL would
@@ -284,6 +302,13 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
   const locStr = [loc.building, loc.room && `Room ${loc.room}`, loc.address].filter(Boolean).join(", ");
   const s = effectiveSettings(ev, date || cand.date);
   const endTime = addMin(cohort.start, s.behavioralMin + s.bufferMin + s.caseMin);
+  /* A reschedule can reuse the exact same template — booking_type below lets that one
+     template say "Rescheduled" vs "New booking" inline. A separate template is only
+     needed if you want genuinely different wording/subject/design for reschedules;
+     if CONFIG.emailJs.templateIdCandidateRescheduled is set, that one is used instead. */
+  const templateId = (kind === "rescheduled" && CONFIG.emailJs.templateIdCandidateRescheduled)
+    ? CONFIG.emailJs.templateIdCandidateRescheduled
+    : CONFIG.emailJs.templateIdCandidate;
   const params = {
     to_email: cand.email,
     to_name: cand.name,
@@ -306,13 +331,77 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         service_id: CONFIG.emailJs.serviceId,
-        template_id: CONFIG.emailJs.templateIdCandidate,
+        template_id: templateId,
         user_id: CONFIG.emailJs.publicKey,
         template_params: params,
       }),
     });
     return { sent: true };
   } catch (e) { console.error("Candidate email failed", e); return { sent: false }; }
+}
+
+/* ============================================================
+   GOOGLE SHEETS LOGGING (candidate bookings)
+   ------------------------------------------------------------
+   Client-side JS can't write to a Google Sheet directly without
+   exposing credentials, so this posts to a Google Apps Script
+   "Web App" endpoint instead — a small script attached to the
+   Sheet that accepts a POST and appends a row. Setup (one-time):
+
+   1. Create a Google Sheet — e.g. "180DC Interview Bookings".
+   2. Extensions → Apps Script. Replace the contents with:
+
+        var EXPECTED_SECRET = "Uo-RaFW8vhAYDqFW88F-xmjLHHrxlSkB"; // must match CONFIG.sheetsWebhookSecret below
+
+        function doPost(e) {
+          var data = JSON.parse(e.postData.contents);
+          if (data.secret !== EXPECTED_SECRET) {
+            return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad secret" }))
+              .setMimeType(ContentService.MimeType.JSON);
+          }
+          var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+          sheet.appendRow([
+            new Date(), data.status, data.name, data.email, data.purdueId,
+            data.phone, data.eventName, data.date, data.time, data.bookingId
+          ]);
+          return ContentService.createTextOutput(JSON.stringify({ ok: true }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+
+   3. Deploy → New deployment → type "Web app". Set "Execute as: Me"
+      and "Who has access: Anyone" (needs to be reachable from a
+      candidate's browser with no Google login). Deploy, then copy
+      the Web App URL (ends in /exec).
+   4. Paste that URL into CONFIG.sheetsWebhookUrl below, and keep
+      CONFIG.sheetsWebhookSecret matching EXPECTED_SECRET above —
+      if you ever change one, change the other to match.
+
+   The secret filters out stray/spam POSTs sent straight to the URL
+   instead of through this app's booking flow — it is NOT a private
+   credential (it ships in this public JS same as the URL does), it
+   just isn't the sort of thing a casual scraper bothers to guess.
+
+   Requests are fire-and-forget with mode: "no-cors" (Apps Script
+   doesn't return CORS headers by default), so the response can't be
+   read to confirm success — this is a best-effort log, not something
+   the booking flow depends on. If it fails, booking still succeeds.
+   ============================================================ */
+function logCandidateToSheet(cand, ev, cohort, date, status = "booked") {
+  if (!CONFIG.sheetsWebhookUrl) return;
+  const payload = {
+    secret: CONFIG.sheetsWebhookSecret,
+    status,
+    name: cand.name, email: cand.email, purdueId: cand.purdueId, phone: cand.phone || "",
+    eventName: ev?.name || "", date: prettyDate(date || cand.date), time: cohort?.start || "",
+    bookingId: cand.id,
+  };
+  try {
+    fetch(CONFIG.sheetsWebhookUrl, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids a CORS preflight Apps Script won't answer
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  } catch (e) { /* best-effort only — never blocks booking */ }
 }
 
 function mailtoDraft(booking) {
@@ -666,14 +755,22 @@ export default function App() {
     await save((prev) => ({ ...prev, candidates: [...(prev.candidates || []), cand] }));
     setLastCandidate({ cand, ev, cohort, date });
     go("iv-confirm");
+    logCandidateToSheet(cand, ev, cohort, date, "booked");
     setCandEmailStatus("pending");
     const r = await sendCandidateEmail(cand, ev, cohort, date);
     setCandEmailStatus(r.sent ? "sent" : "manual");
     return { ok: true };
   };
 
-  const cancelCandidate = async (candId) =>
-    save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? { ...c, cancelled: true } : c) }));
+  const cancelCandidate = async (candId) => {
+    const cand = (dataRef.current.candidates || []).find((c) => c.id === candId);
+    await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? { ...c, cancelled: true } : c) }));
+    if (cand) {
+      const ev = eventById(dataRef.current, cand.eventId);
+      const cohort = ev ? cohortTimes(ev, cand.date).find((c) => c.id === cand.cohortId) : null;
+      logCandidateToSheet(cand, ev, cohort, cand.date, "cancelled");
+    }
+  };
 
   const rescheduleCandidate = async (candId, newDate, newCohortId) => {
     const cand = (dataRef.current.candidates || []).find((c) => c.id === candId);
@@ -685,6 +782,7 @@ export default function App() {
     const updated = { ...cand, date: newDate, cohortId: newCohortId, status: "Not Arrived" };
     await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? updated : c) }));
     const newCohort = cohortTimes(ev, newDate).find((c) => c.id === newCohortId);
+    logCandidateToSheet(updated, ev, newCohort, newDate, "rescheduled");
     if (newCohort) sendCandidateEmail(updated, ev, newCohort, newDate, "rescheduled").catch((e) => console.error("Reschedule email failed", e));
     return { ok: true };
   };
@@ -2106,16 +2204,6 @@ function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, ac
         <h3 className="step-h" style={{ marginTop: 0 }}>Create an interview event</h3>
         <p className="muted" style={{ marginTop: -6, marginBottom: 16 }}>Set the location, format, and time window once. You then add as many interview <b>dates</b> as you want to this event — no need to re-enter anything. Reuse it all semester.</p>
         <Field label="Event name" value={f.name} onChange={set("name")} placeholder="Fall 2026 Consultant Interviews" />
-        <label className="field"><span>Interview dates — add one or more</span>
-          <div className="date-add-row">
-            <input type="date" className="date-add-input" value={dateInput} onChange={(e) => setDateInput(e.target.value)} />
-            <Btn small type="button" onClick={addDate} disabled={!dateInput}>+ Add date</Btn>
-          </div>
-        </label>
-        <div className="date-chip-row" style={{ marginBottom: 14 }}>
-          {dates.length === 0 ? <span className="muted">No dates added yet — you can also add them later in Settings.</span> :
-            dates.map((d) => <span key={d} className="date-chip">{prettyDate(d)}<button type="button" onClick={() => rmDate(d)} title="Remove">×</button></span>)}
-        </div>
         <div className="field-row">
           <Field label="Building" value={f.building} onChange={set("building")} placeholder="Rawls Hall" />
           <Field label="Room" value={f.room} onChange={set("room")} placeholder="3082" />
@@ -2132,7 +2220,19 @@ function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, ac
           <Field label="Case (min)" type="number" min="1" value={f.caseMin} onChange={set("caseMin")} />
           <Field label="Lead time (min)" type="number" min="1" value={f.leadTimeMin} onChange={set("leadTimeMin")} />
         </div>
-        <p className="muted" style={{ marginTop: -8, marginBottom: 10 }}>Lead time = how many minutes before the previous pod's case round ends that the next pod's behavioral round starts. No pod is ever generated past your end time.</p>
+        <p className="muted field-note">Lead time = how many minutes before the previous pod's case round ends that the next pod's behavioral round starts. No pod is ever generated past your end time.</p>
+
+        <label className="field"><span>Interview dates — add one or more</span>
+          <div className="date-add-row">
+            <input type="date" className="date-add-input" value={dateInput} onChange={(e) => setDateInput(e.target.value)} />
+            <Btn small type="button" onClick={addDate} disabled={!dateInput}>+ Add date</Btn>
+          </div>
+        </label>
+        <div className="date-chip-row" style={{ marginBottom: 14 }}>
+          {dates.length === 0 ? <span className="muted">No dates added yet — you can also add them later in Settings.</span> :
+            dates.map((d) => <span key={d} className="date-chip">{prettyDate(d)}<button type="button" onClick={() => rmDate(d)} title="Remove">×</button></span>)}
+        </div>
+
         <div className="gen-preview">
           <span className="muted">Each date will have <b style={{ color: "var(--green)" }}>{preview.length}</b> pod{preview.length === 1 ? "" : "s"} ({preview.length * (+f.candidatesPerCohort)} spots/day):</span>
           <div className="prev-pills">
@@ -2172,7 +2272,7 @@ function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, ac
             <Field label="Candidates per pod" type="number" min="1" value={ovForm.candidatesPerCohort} onChange={ovField("candidatesPerCohort")} />
             <Field label="Number of pods (optional)" type="number" min="1" placeholder="Auto from end time" value={ovForm.podsCount} onChange={ovField("podsCount")} />
           </div>
-          <p className="muted" style={{ marginTop: -8, marginBottom: 10, fontSize: 12.5 }}>
+          <p className="muted field-note" style={{ fontSize: 12.5 }}>
             Leave "Number of pods" blank to let the end time decide, as usual. Set a number to open <b>exactly</b> that many pods for this day no matter what the end time says — e.g. set it to 3 for a lighter final day so nothing past the 3rd pod is ever offered, even if you leave the end time later.
           </p>
 
@@ -2349,9 +2449,20 @@ function IADayOf({ data, save, ev, date }) {
    Each candidate gets TWO behavioral interviewers (evaluating together), so a
    4-candidate pod needs 8 named behavioral slots, plus 2 named guest/case
    interviewers for the pod's case round. All manual — no auto-rotation. ---- */
+/* ---- Interviewers: manual name assignment per pod ---- */
 function IAInterviewers({ data, save, ev, date }) {
+  /* Inputs below used to be fully controlled straight off the remote `data`
+     prop — every keystroke round-tripped to storage before the input could
+     show the next character. If that round trip lagged even slightly behind
+     typing speed, a stale snapshot would land mid-typing and stomp on
+     characters already entered, which is what showed up as "lagging /
+     deleting letters". Buffering locally and only committing on blur removes
+     the round trip from the typing path entirely. */
+  const [localMeta, setLocalMeta] = useState({}); // { [cohortId]: { behavioralIvs?, guestIvs? } }
+  useEffect(() => { setLocalMeta({}); }, [ev && ev.id, date]);
   if (!ev) return <EmptyEvents />;
   if (!date) return <div className="empty-state fadein"><p>No date selected.</p></div>;
+
   const setMeta = async (cohortId, patch) => {
     const key = `${date}|${cohortId}`;
     await save((prev) => {
@@ -2361,16 +2472,25 @@ function IAInterviewers({ data, save, ev, date }) {
       return { ...prev, interviewEvents: events };
     });
   };
-  const setBehavioral = (cohortId, idx, val) => {
-    const cur = cohortMeta(ev, date, cohortId).behavioralIvs || [];
-    const arr = [...cur]; arr[idx] = val;
-    setMeta(cohortId, { behavioralIvs: arr });
+
+  const editArr = (field) => (cohortId, idx, val) => {
+    setLocalMeta((prev) => {
+      const remote = cohortMeta(ev, date, cohortId)[field] || [];
+      const cur = prev[cohortId]?.[field] !== undefined ? prev[cohortId][field] : remote;
+      const arr = [...cur]; arr[idx] = val;
+      return { ...prev, [cohortId]: { ...(prev[cohortId] || {}), [field]: arr } };
+    });
   };
-  const setGuest = (cohortId, idx, val) => {
-    const cur = cohortMeta(ev, date, cohortId).guestIvs || [];
-    const arr = [...cur]; arr[idx] = val;
-    setMeta(cohortId, { guestIvs: arr });
+  const setBehavioral = editArr("behavioralIvs");
+  const setGuest = editArr("guestIvs");
+
+  const commit = (field) => (cohortId) => {
+    const buf = localMeta[cohortId];
+    if (!buf || buf[field] === undefined) return;
+    setMeta(cohortId, { [field]: buf[field] });
   };
+  const commitBehavioral = commit("behavioralIvs");
+  const commitGuest = commit("guestIvs");
 
   const cohorts = cohortTimes(ev, date);
 
@@ -2380,7 +2500,10 @@ function IAInterviewers({ data, save, ev, date }) {
 
       {cohorts.map((c) => {
         const cap = cohortCapacity(ev, date, c.id);
-        const meta = cohortMeta(ev, date, c.id);
+        const remoteMeta = cohortMeta(ev, date, c.id);
+        const buf = localMeta[c.id] || {};
+        const behavioralIvs = buf.behavioralIvs !== undefined ? buf.behavioralIvs : (remoteMeta.behavioralIvs || []);
+        const guestIvs = buf.guestIvs !== undefined ? buf.guestIvs : (remoteMeta.guestIvs || []);
         return (
           <div key={c.id} className="card iv-assign">
             <div className="do-head"><b>{c.start} Pod</b><span className="muted">capacity {cap}</span></div>
@@ -2388,16 +2511,19 @@ function IAInterviewers({ data, save, ev, date }) {
               {Array.from({ length: cap * 2 }).map((_, i) => (
                 <label key={i} className="assign-field">
                   <span>Candidate {Math.floor(i / 2) + 1} — Behavioral IV {(i % 2) + 1}</span>
-                  <input value={(meta.behavioralIvs || [])[i] || ""} onChange={(e) => setBehavioral(c.id, i, e.target.value)} placeholder="Interviewer name" />
+                  <input value={behavioralIvs[i] || ""} onChange={(e) => setBehavioral(c.id, i, e.target.value)}
+                    onBlur={() => commitBehavioral(c.id)} placeholder="Interviewer name" />
                 </label>
               ))}
               <label className="assign-field">
                 <span>Guest Interviewer 1</span>
-                <input value={(meta.guestIvs || [])[0] || ""} onChange={(e) => setGuest(c.id, 0, e.target.value)} placeholder="Interviewer name" />
+                <input value={guestIvs[0] || ""} onChange={(e) => setGuest(c.id, 0, e.target.value)}
+                  onBlur={() => commitGuest(c.id)} placeholder="Interviewer name" />
               </label>
               <label className="assign-field">
                 <span>Guest Interviewer 2</span>
-                <input value={(meta.guestIvs || [])[1] || ""} onChange={(e) => setGuest(c.id, 1, e.target.value)} placeholder="Interviewer name" />
+                <input value={guestIvs[1] || ""} onChange={(e) => setGuest(c.id, 1, e.target.value)}
+                  onBlur={() => commitGuest(c.id)} placeholder="Interviewer name" />
               </label>
             </div>
           </div>
@@ -2939,6 +3065,11 @@ tr:hover td { background: #FAFBF7; }
 .cc-list .cc-name:first-child { border-top: none; }
 
 .field-row-3, .field-row-4 { margin-bottom: 0; }
+/* explicit positive spacing (never negative) for a helper line right after a
+   field-row — field-row-3/4 strip their own bottom margin so their labels can
+   wrap on narrow screens without a trailing paragraph riding up into the
+   input above it */
+.field-note { margin-top: 10px; margin-bottom: 10px; }
 .gen-preview { margin: 16px 0 4px; }
 .prev-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .prev-pill { background: var(--tint); border: 1px solid var(--green); color: var(--greenDark); border-radius: 999px;
