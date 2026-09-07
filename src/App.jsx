@@ -69,9 +69,11 @@ const CONFIG = {
                                                    // for reschedule emails specifically.
     publicKey: "yi_V4EsX4rBuPD2yM",
   },
-  /* Google Apps Script Web App URL that logs every candidate booking to a Google
-     Sheet (name, email, chosen date/time, etc). Leave blank to disable — booking
-     works fine without it. See the setup instructions above logCandidateToSheet(). */
+  /* Google Apps Script Web App URL that keeps a Google Sheet in sync with every
+     candidate booking + interview-day status change (name, email, chosen date/
+     time, checked-in/behavioral/case/completed/no-show, reschedules). Leave
+     blank to disable — booking works fine without it. See the setup
+     instructions above syncCandidateToSheet(). */
   sheetsWebhookUrl: "https://script.google.com/macros/s/AKfycbz7VXrJIpXY0CSSjxqhHub5pbHgqaBg0jDm3744Bdi0TvNJkWjjInW6LdS_5Pftb8_4ZQ/exec",
   /* Shared secret sent with every logging request and checked by the Apps Script
      before it appends a row — without this, anyone who found the webhook URL in
@@ -341,59 +343,131 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
 }
 
 /* ============================================================
-   GOOGLE SHEETS LOGGING (candidate bookings)
+   GOOGLE SHEETS SYNC (candidate bookings + live interview-day status)
    ------------------------------------------------------------
-   Client-side JS can't write to a Google Sheet directly without
-   exposing credentials, so this posts to a Google Apps Script
-   "Web App" endpoint instead — a small script attached to the
-   Sheet that accepts a POST and appends a row. Setup (one-time):
+   One spreadsheet, several tabs, kept in sync as things happen in the app:
 
-   1. Create a Google Sheet — e.g. "180DC Interview Bookings".
-   2. Extensions → Apps Script. Replace the contents with:
+   - "All Bookings" — one row per candidate, matched by Booking ID and
+     updated IN PLACE (never duplicated), including on reschedule.
+   - One tab PER INTERVIEW DATE (auto-created, named by the ISO date e.g.
+     "2026-09-06") — just Name / Email / Time / Status, matched by email
+     (unique within an event already, per the app's own duplicate-booking
+     guard). Rows get added/updated/deleted/moved as things change.
+   - "No Shows" — Name / Email / Purdue ID / Phone / Booking ID / their
+     original date & time. Row is colored red and removed from the date
+     tab once it lands here.
 
-        var EXPECTED_SECRET = "Uo-RaFW8vhAYDqFW88F-xmjLHHrxlSkB"; // must match CONFIG.sheetsWebhookSecret below
+   Setup: paste the Apps Script below into the SAME spreadsheet/project as
+   before (replacing what's there), keep the same deployment URL/secret —
+   no need to redo the CONFIG.sheetsWebhookUrl step.
 
-        function doPost(e) {
-          var data = JSON.parse(e.postData.contents);
-          if (data.secret !== EXPECTED_SECRET) {
-            return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad secret" }))
-              .setMimeType(ContentService.MimeType.JSON);
-          }
-          var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-          sheet.appendRow([
-            new Date(), data.status, data.name, data.email, data.purdueId,
-            data.phone, data.eventName, data.date, data.time, data.bookingId
-          ]);
-          return ContentService.createTextOutput(JSON.stringify({ ok: true }))
-            .setMimeType(ContentService.MimeType.JSON);
-        }
+     var EXPECTED_SECRET = "Uo-RaFW8vhAYDqFW88F-xmjLHHrxlSkB"; // must match CONFIG.sheetsWebhookSecret
 
-   3. Deploy → New deployment → type "Web app". Set "Execute as: Me"
-      and "Who has access: Anyone" (needs to be reachable from a
-      candidate's browser with no Google login). Deploy, then copy
-      the Web App URL (ends in /exec).
-   4. Paste that URL into CONFIG.sheetsWebhookUrl below, and keep
-      CONFIG.sheetsWebhookSecret matching EXPECTED_SECRET above —
-      if you ever change one, change the other to match.
+     var MASTER_TAB = "All Bookings";
+     var NOSHOW_TAB = "No Shows";
 
-   The secret filters out stray/spam POSTs sent straight to the URL
-   instead of through this app's booking flow — it is NOT a private
-   credential (it ships in this public JS same as the URL does), it
-   just isn't the sort of thing a casual scraper bothers to guess.
+     function doPost(e) {
+       var data = JSON.parse(e.postData.contents);
+       if (data.secret !== EXPECTED_SECRET) return json({ ok: false, error: "bad secret" });
+       var ss = SpreadsheetApp.getActiveSpreadsheet();
+       if (data.action === "book" || data.action === "status") {
+         upsertMaster(ss, data);
+         upsertDateRow(ss, data.date, data);
+       } else if (data.action === "noshow") {
+         upsertMaster(ss, data);
+         markNoShow(ss, data.date, data);
+       } else if (data.action === "reschedule") {
+         upsertMaster(ss, data);
+         if (data.prevDate && data.prevDate !== data.date) removeRowByEmail(ss, data.prevDate, data.email);
+         upsertDateRow(ss, data.date, data);
+       } else if (data.action === "cancel") {
+         upsertMaster(ss, data);
+         removeRowByEmail(ss, data.date, data.email);
+       }
+       return json({ ok: true });
+     }
 
-   Requests are fire-and-forget with mode: "no-cors" (Apps Script
-   doesn't return CORS headers by default), so the response can't be
-   read to confirm success — this is a best-effort log, not something
-   the booking flow depends on. If it fails, booking still succeeds.
+     function json(obj) {
+       return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+     }
+
+     function getOrCreateSheet(ss, name, header) {
+       var sheet = ss.getSheetByName(name);
+       if (!sheet) {
+         sheet = ss.insertSheet(name);
+         sheet.appendRow(header);
+         sheet.getRange(1, 1, 1, header.length).setFontWeight("bold");
+       }
+       return sheet;
+     }
+
+     function findRow(sheet, colIndex, value) {
+       var vals = sheet.getDataRange().getValues();
+       for (var i = 1; i < vals.length; i++) if (vals[i][colIndex] === value) return i + 1;
+       return -1;
+     }
+
+     function upsertMaster(ss, data) {
+       var sheet = getOrCreateSheet(ss, MASTER_TAB, ["Name", "Email", "Purdue ID", "Phone", "Event", "Date", "Time", "Booking ID", "Status"]);
+       var row = findRow(sheet, 7, data.bookingId); // col H, 0-indexed = 7
+       var values = [data.name, data.email, data.purdueId, data.phone, data.eventName, data.dateLabel, data.time, data.bookingId, data.status];
+       if (row === -1) sheet.appendRow(values); else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+     }
+
+     function upsertDateRow(ss, date, data) {
+       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status"]);
+       var row = findRow(sheet, 1, data.email); // col B, 0-indexed = 1
+       var values = [data.name, data.email, data.time, data.status];
+       if (row === -1) sheet.appendRow(values); else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+     }
+
+     function removeRowByEmail(ss, date, email) {
+       var sheet = ss.getSheetByName(date);
+       if (!sheet) return;
+       var row = findRow(sheet, 1, email);
+       if (row !== -1) sheet.deleteRow(row);
+     }
+
+     function markNoShow(ss, date, data) {
+       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status"]);
+       var row = findRow(sheet, 1, data.email);
+       var values = [data.name, data.email, data.time, "No Show"];
+       if (row === -1) { sheet.appendRow(values); row = sheet.getLastRow(); }
+       else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+       sheet.getRange(row, 1, 1, 4).setBackground("#f8d7da");
+
+       var noshow = getOrCreateSheet(ss, NOSHOW_TAB, ["Name", "Email", "Purdue ID", "Phone", "Booking ID", "Original Date", "Original Time"]);
+       var nsRow = findRow(noshow, 4, data.bookingId); // col E, 0-indexed = 4
+       var nsValues = [data.name, data.email, data.purdueId, data.phone, data.bookingId, data.dateLabel, data.time];
+       if (nsRow === -1) { noshow.appendRow(nsValues); nsRow = noshow.getLastRow(); }
+       else noshow.getRange(nsRow, 1, 1, nsValues.length).setValues([nsValues]);
+       noshow.getRange(nsRow, 1, 1, nsValues.length).setBackground("#f8d7da");
+
+       sheet.deleteRow(row); // now logged in No Shows, drop from the date tab
+     }
+
+   After pasting: Deploy → Manage deployments → edit the existing deployment
+   → New version → Deploy (keeps the same URL, no CONFIG change needed).
+
+   Tabs are named by the RAW ISO date (e.g. "2026-09-06", matching the app's
+   internal date format) rather than a pretty label — keeps matching exact
+   and avoids characters Sheets tab names don't like. "All Bookings" and
+   "No Shows" show a human-readable date in their own Date/Original Date
+   column instead.
    ============================================================ */
-function logCandidateToSheet(cand, ev, cohort, date, status = "booked") {
+function syncCandidateToSheet(action, cand, ev, cohort, date, opts = {}) {
   if (!CONFIG.sheetsWebhookUrl) return;
   const payload = {
     secret: CONFIG.sheetsWebhookSecret,
-    status,
-    name: cand.name, email: cand.email, purdueId: cand.purdueId, phone: cand.phone || "",
-    eventName: ev?.name || "", date: prettyDate(date || cand.date), time: cohort?.start || "",
+    action, // "book" | "status" | "noshow" | "reschedule" | "cancel"
+    eventName: ev?.name || "",
     bookingId: cand.id,
+    name: cand.name, email: cand.email, purdueId: cand.purdueId, phone: cand.phone || "",
+    date: date || cand.date,                       // raw ISO date — used as the tab name
+    dateLabel: prettyDate(date || cand.date),       // human-readable — used inside sheet cells
+    time: cohort?.start || "",
+    status: opts.status || cand.status || "Not Arrived",
+    prevDate: opts.prevDate, // only set for "reschedule" — which date tab to remove the old row from
   };
   try {
     fetch(CONFIG.sheetsWebhookUrl, {
@@ -401,7 +475,7 @@ function logCandidateToSheet(cand, ev, cohort, date, status = "booked") {
       headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids a CORS preflight Apps Script won't answer
       body: JSON.stringify(payload),
     }).catch(() => {});
-  } catch (e) { /* best-effort only — never blocks booking */ }
+  } catch (e) { /* best-effort only — never blocks the app */ }
 }
 
 function mailtoDraft(booking) {
@@ -755,7 +829,7 @@ export default function App() {
     await save((prev) => ({ ...prev, candidates: [...(prev.candidates || []), cand] }));
     setLastCandidate({ cand, ev, cohort, date });
     go("iv-confirm");
-    logCandidateToSheet(cand, ev, cohort, date, "booked");
+    syncCandidateToSheet("book", cand, ev, cohort, date, { status: "Not Arrived" });
     setCandEmailStatus("pending");
     const r = await sendCandidateEmail(cand, ev, cohort, date);
     setCandEmailStatus(r.sent ? "sent" : "manual");
@@ -768,7 +842,7 @@ export default function App() {
     if (cand) {
       const ev = eventById(dataRef.current, cand.eventId);
       const cohort = ev ? cohortTimes(ev, cand.date).find((c) => c.id === cand.cohortId) : null;
-      logCandidateToSheet(cand, ev, cohort, cand.date, "cancelled");
+      syncCandidateToSheet("cancel", cand, ev, cohort, cand.date, { status: "Cancelled" });
     }
   };
 
@@ -779,10 +853,11 @@ export default function App() {
     if (!ev) return { ok: false, msg: "Interview event not found." };
     if (cohortClosed(ev, newDate, newCohortId) || cohortRemaining(dataRef.current, ev, newDate, newCohortId) <= 0)
       return { ok: false, msg: "That time just filled up — please pick another." };
+    const prevDate = cand.date;
     const updated = { ...cand, date: newDate, cohortId: newCohortId, status: "Not Arrived" };
     await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? updated : c) }));
     const newCohort = cohortTimes(ev, newDate).find((c) => c.id === newCohortId);
-    logCandidateToSheet(updated, ev, newCohort, newDate, "rescheduled");
+    syncCandidateToSheet("reschedule", updated, ev, newCohort, newDate, { status: "Not Arrived", prevDate });
     if (newCohort) sendCandidateEmail(updated, ev, newCohort, newDate, "rescheduled").catch((e) => console.error("Reschedule email failed", e));
     return { ok: true };
   };
@@ -2463,8 +2538,14 @@ function IACandidates({ data, save, ev }) {
 function IADayOf({ data, save, ev, date }) {
   if (!ev) return <EmptyEvents />;
   if (!date) return <div className="empty-state fadein"><p>No date selected.</p></div>;
-  const setStatus = async (id, status) =>
-    save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === id ? { ...c, status } : c) }));
+  const setStatus = async (id, status) => {
+    const cand = (data.candidates || []).find((c) => c.id === id);
+    await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === id ? { ...c, status } : c) }));
+    if (cand) {
+      const cohort = cohortTimes(ev, date).find((k) => k.id === cand.cohortId);
+      syncCandidateToSheet(status === "No Show" ? "noshow" : "status", cand, ev, cohort, date, { status });
+    }
+  };
 
   const cohorts = cohortTimes(ev, date);
   const any = cohorts.some((c) => candidatesInCohort(data, ev.id, date, c.id).length > 0);
