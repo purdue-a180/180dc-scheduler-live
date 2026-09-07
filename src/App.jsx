@@ -282,7 +282,8 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
   if (!emailConfigured() || !CONFIG.emailJs.templateIdCandidate) return { sent: false };
   const loc = ev.location || {};
   const locStr = [loc.building, loc.room && `Room ${loc.room}`, loc.address].filter(Boolean).join(", ");
-  const endTime = addMin(cohort.start, cohortDuration(ev));
+  const s = effectiveSettings(ev, date || cand.date);
+  const endTime = addMin(cohort.start, s.behavioralMin + s.bufferMin + s.caseMin);
   const params = {
     to_email: cand.email,
     to_name: cand.name,
@@ -294,7 +295,7 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
     location: locStr || "(location to be shared)",
     building: loc.building || "",
     room: loc.room || "",
-    format: `${ev.behavioralMin}-min Behavioral · ${ev.bufferMin}-min Transition · ${ev.caseMin}-min Case Interview`,
+    format: `${s.behavioralMin}-min Behavioral · ${s.bufferMin}-min Transition · ${s.caseMin}-min Case Interview`,
     booking_id: cand.id,
     arrival_note: ev.arrivalInstruction || CONFIG.arrivalInstruction,
     manage_link: `${CONFIG.siteUrl}/?manage=${cand.id}`,
@@ -345,7 +346,10 @@ const addMin = (clockLabel, mins) => {            // ("6:30 PM", 65) -> "7:35 PM
   let h = (+m[1] % 12) + (m[3] === "PM" ? 12 : 0);
   return minToClock(h * 60 + (+m[2]) + mins);
 };
-const cohortDuration = (ev) => ev.behavioralMin + ev.bufferMin + ev.caseMin;
+const cohortDuration = (ev, date) => {
+  const s = date ? effectiveSettings(ev, date) : ev;
+  return s.behavioralMin + s.bufferMin + s.caseMin;
+};
 
 /* An event holds shared settings (location, format, time window) and a list of
    interview DATES. Cohorts are derived from the window + timing rule and are the
@@ -362,13 +366,20 @@ const cohortDuration = (ev) => ev.behavioralMin + ev.bufferMin + ev.caseMin;
    on time is kept even if its case round runs past closing — that's normal,
    expected overrun, not a scheduling violation. Nothing new is ever kicked off
    at or after closing time. */
-function cohortTimes(ev) {
-  const start = clockToMin(ev.startTime), end = clockToMin(ev.endTime);
-  const behavioral = ev.behavioralMin, buffer = ev.bufferMin, caseLen = ev.caseMin;
-  const leadTime = ev.leadTimeMin != null ? ev.leadTimeMin : 20;
+function cohortTimes(ev, date) {
+  const s = effectiveSettings(ev, date);
+  const start = clockToMin(s.startTime), end = clockToMin(s.endTime);
+  const behavioral = s.behavioralMin, buffer = s.bufferMin, caseLen = s.caseMin;
+  const leadTime = s.leadTimeMin != null ? s.leadTimeMin : 20;
+  /* fixedCount (per-date "Number of pods" override) replaces the end-time cutoff
+     entirely — pods are generated one after another using the normal cadence
+     until exactly that many exist, regardless of what the end time says. This is
+     for days where you want to hand-pick the pod count (e.g. a lighter final day)
+     instead of reverse-engineering an end time that happens to produce it. */
+  const fixedCount = s.podsCount != null && s.podsCount !== "" ? +s.podsCount : null;
   const out = [];
   let behStart = start, i = 0;
-  while (behStart < end - 0.001) {
+  while (fixedCount != null ? i < fixedCount : behStart < end - 0.001) {
     const behEnd = behStart + behavioral;
     const caseStart = behEnd + buffer;
     const caseEnd = caseStart + caseLen;
@@ -384,13 +395,48 @@ const generateCohorts = (ev) => cohortTimes(ev).map((c) => ({ ...c, capacity: ev
 const eventById = (data, id) => (data.interviewEvents || []).find((e) => e.id === id);
 const eventDates = (ev) => (ev.dates || []).slice().sort();
 
+/* per-date overrides live on ev.dateMeta["<date>"] = { startTime?, endTime?, behavioralMin?,
+   bufferMin?, caseMin?, leadTimeMin?, candidatesPerCohort?, podsCount? }. Any field present there
+   overrides the event-wide default for JUST that date — so one event can mix, say, two full
+   5–9 PM days with a shorter, lower-headcount day, without needing a separate event.
+   podsCount (when set) is a direct "open exactly N pods" override — see cohortTimes. It only
+   ever lives per-date, never as an event-wide default, since the event's own creation flow is
+   always end-time-driven. */
+const dateOverride = (ev, date) => (date && ev.dateMeta && ev.dateMeta[date]) || {};
+const hasDateOverride = (ev, date) => Object.keys(dateOverride(ev, date)).length > 0;
+const effectiveSettings = (ev, date) => {
+  const o = dateOverride(ev, date);
+  return {
+    startTime: o.startTime || ev.startTime,
+    endTime: o.endTime || ev.endTime,
+    behavioralMin: o.behavioralMin != null ? o.behavioralMin : ev.behavioralMin,
+    bufferMin: o.bufferMin != null ? o.bufferMin : ev.bufferMin,
+    caseMin: o.caseMin != null ? o.caseMin : ev.caseMin,
+    leadTimeMin: o.leadTimeMin != null ? o.leadTimeMin : ev.leadTimeMin,
+    candidatesPerCohort: o.candidatesPerCohort != null ? o.candidatesPerCohort : ev.candidatesPerCohort,
+    podsCount: o.podsCount != null ? o.podsCount : (ev.podsCount != null ? ev.podsCount : null),
+  };
+};
+
 /* per-cohort overrides live on ev.cohortMeta["<date>|<cohortId>"] = { capacity?, closed?, behavioralIvs?, guestIvs? } */
 const cohortMeta = (ev, date, cohortId) => (ev.cohortMeta || {})[`${date}|${cohortId}`] || {};
 const cohortCapacity = (ev, date, cohortId) => {
   const m = cohortMeta(ev, date, cohortId);
-  return m.capacity != null ? m.capacity : ev.candidatesPerCohort;
+  return m.capacity != null ? m.capacity : effectiveSettings(ev, date).candidatesPerCohort;
 };
 const cohortClosed = (ev, date, cohortId) => !!cohortMeta(ev, date, cohortId).closed;
+
+/* Once an event is published, its schedule/config is meant to stop moving under
+   candidates who've already booked off of it. Any discrete change to the event
+   (dates, timing, capacity, location, deleting it) is gated behind a password.
+   Routine operational data entry that isn't part of the published schedule itself
+   (booking a candidate, running interview-night timers, jotting interviewer
+   names) is intentionally left ungated. The actual prompt is an in-app modal
+   (see PasswordGateModal / requestUnlock in InterviewAdmin) rather than
+   window.prompt — native browser dialogs are silently blocked inside sandboxed
+   iframes (including this preview), which made the gate look like it was doing
+   nothing at all. */
+const EVENT_EDIT_PASSWORD = "12345";
 
 const candidatesInCohort = (data, eventId, date, cohortId) =>
   (data.candidates || []).filter((c) => c.eventId === eventId && c.date === date && c.cohortId === cohortId && !c.cancelled);
@@ -408,11 +454,11 @@ const nowMinOfDayLocal = () => { const d = new Date(); return d.getHours() * 60 
 /* dates on an event that still have any open, NOT-YET-STARTED cohort */
 const openDates = (data, ev) =>
   eventDates(ev).filter((d) => d >= todayLocalStr() &&
-    cohortTimes(ev).some((c) => !cohortClosed(ev, d, c.id) && cohortRemaining(data, ev, d, c.id) > 0 &&
+    cohortTimes(ev, d).some((c) => !cohortClosed(ev, d, c.id) && cohortRemaining(data, ev, d, c.id) > 0 &&
       !(d === todayLocalStr() && c.startMin <= nowMinOfDayLocal())));
 /* open, NOT-YET-STARTED cohort times on a specific date */
 const openCohortsOn = (data, ev, date) =>
-  date < todayLocalStr() ? [] : cohortTimes(ev).filter((c) => !cohortClosed(ev, date, c.id) && cohortRemaining(data, ev, date, c.id) > 0 &&
+  date < todayLocalStr() ? [] : cohortTimes(ev, date).filter((c) => !cohortClosed(ev, date, c.id) && cohortRemaining(data, ev, date, c.id) > 0 &&
     !(date === todayLocalStr() && c.startMin <= nowMinOfDayLocal()));
 
 /* all candidates for an event across dates */
@@ -443,6 +489,57 @@ const Field = ({ label, ...props }) => (
     <input {...props} />
   </label>
 );
+
+/* Small circular completion indicator. pct 0-100. `tone` picks the ring color
+   independently of pct (e.g. red while a pod is overtime even at low %). */
+/* Blocking password modal for editing a published event. Resolves the Promise
+   from requestUnlock() true/false — shows an inline "Incorrect password" and
+   stays open on a wrong guess instead of closing, so a fumbled attempt doesn't
+   need to retrigger the whole action. */
+function PasswordGateModal({ onResolve }) {
+  const [val, setVal] = useState("");
+  const [err, setErr] = useState(false);
+  const submit = () => {
+    if (val === EVENT_EDIT_PASSWORD) { onResolve(true); return; }
+    setErr(true); setVal("");
+  };
+  return (
+    <div className="modal-overlay" onClick={() => onResolve(false)}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <h3 className="step-h" style={{ marginTop: 0 }}>🔒 Password required</h3>
+        <p className="muted" style={{ marginTop: -6, marginBottom: 14 }}>This event is published. Enter the admin password to make this change.</p>
+        <input type="password" autoFocus className="modal-pw-input" value={val}
+          onChange={(e) => { setVal(e.target.value); setErr(false); }}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); if (e.key === "Escape") onResolve(false); }}
+          placeholder="Password" />
+        {err && <p className="err" style={{ marginTop: 8, marginBottom: 0 }}>Incorrect password — try again.</p>}
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <Btn onClick={submit}>Unlock</Btn>
+          <Btn kind="outline" onClick={() => onResolve(false)}>Cancel</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const ProgressRing = ({ pct, size = 44, stroke = 5, tone = "green", label }) => {
+  const p = Math.max(0, Math.min(100, pct));
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const off = c * (1 - p / 100);
+  const colors = { green: "var(--green)", amber: "#E0A800", red: "#C0392B" };
+  return (
+    <div className="progress-ring" style={{ width: size, height: size }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#EDEDEA" strokeWidth={stroke} />
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke={colors[tone] || colors.green} strokeWidth={stroke}
+          strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round"
+          transform={`rotate(-90 ${size / 2} ${size / 2})`} style={{ transition: "stroke-dashoffset .5s cubic-bezier(.22,1,.36,1), stroke .3s" }} />
+      </svg>
+      <span className="progress-ring-label">{label != null ? label : `${Math.round(p)}%`}</span>
+    </div>
+  );
+};
 
 /* ================================================================ */
 export default function App() {
@@ -545,7 +642,7 @@ export default function App() {
   /* ---- prospective consultant booking ---- */
   const bookCandidate = async (eventId, date, cohortId, form) => {
     const ev = eventById(data, eventId);
-    const cohort = cohortTimes(ev).find((c) => c.id === cohortId);
+    const cohort = cohortTimes(ev, date).find((c) => c.id === cohortId);
     if (!ev || !cohort) return { ok: false, msg: "That interview is no longer available." };
     if (cohortClosed(ev, date, cohortId) || cohortRemaining(data, ev, date, cohortId) <= 0)
       return { ok: false, msg: "That time just filled up — please pick another slot." };
@@ -556,7 +653,7 @@ export default function App() {
       c.eventId === eventId && !c.cancelled &&
       (c.email.trim().toLowerCase() === email || (pid && c.purdueId.trim().toLowerCase() === pid)));
     if (dup) {
-      const dupCohort = cohortTimes(ev).find((c) => c.id === dup.cohortId);
+      const dupCohort = cohortTimes(ev, dup.date).find((c) => c.id === dup.cohortId);
       return { ok: false, dup, msg: `You already have an interview booked for this event on ${prettyDate(dup.date)} at ${dupCohort ? dupCohort.start : ""}. Use your confirmation email's manage link to change it.` };
     }
     const cand = {
@@ -587,7 +684,7 @@ export default function App() {
       return { ok: false, msg: "That time just filled up — please pick another." };
     const updated = { ...cand, date: newDate, cohortId: newCohortId, status: "Not Arrived" };
     await save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === candId ? updated : c) }));
-    const newCohort = cohortTimes(ev).find((c) => c.id === newCohortId);
+    const newCohort = cohortTimes(ev, newDate).find((c) => c.id === newCohortId);
     if (newCohort) sendCandidateEmail(updated, ev, newCohort, newDate, "rescheduled").catch((e) => console.error("Reschedule email failed", e));
     return { ok: true };
   };
@@ -1166,7 +1263,7 @@ function InterviewBooking({ data, onBook, go }) {
   const set = (k) => (e) => { if (error) setError(""); setForm({ ...form, [k]: e.target.value }); };
 
   const dates = ev ? openDates(data, ev) : [];
-  const cohort = ev && cohortId ? cohortTimes(ev).find((c) => c.id === cohortId) : null;
+  const cohort = ev && cohortId ? cohortTimes(ev, date).find((c) => c.id === cohortId) : null;
   const puidValid = /^\d{10}$/.test(form.purdueId.trim());
   const detailsValid = form.name.trim() && /^\S+@\S+\.\S+$/.test(form.email) && puidValid;
 
@@ -1181,7 +1278,7 @@ function InterviewBooking({ data, onBook, go }) {
     if (step === 1) {
       const dup = existingBooking();
       if (dup) {
-        const dc = cohortTimes(ev).find((c) => c.id === dup.cohortId);
+        const dc = cohortTimes(ev, dup.date).find((c) => c.id === dup.cohortId);
         return setError(`You already have an interview booked on ${prettyDate(dup.date)} at ${dc ? dc.start : ""}. Check your confirmation email to change it.`);
       }
     }
@@ -1341,7 +1438,7 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
   }
 
   const ev = eventById(data, cand.eventId);
-  const cohort = ev ? cohortTimes(ev).find((c) => c.id === cand.cohortId) : null;
+  const cohort = ev ? cohortTimes(ev, cand.date).find((c) => c.id === cand.cohortId) : null;
   const loc = ev?.location || {};
   const fname = firstName(cand.name);
 
@@ -1369,7 +1466,7 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
 
   /* rescheduled success + affirmation */
   if (mode === "done") {
-    const nc = cohortTimes(ev).find((c) => c.id === newCohort);
+    const nc = cohortTimes(ev, newDate).find((c) => c.id === newCohort);
     return (
       <section className="page narrow confirm">
         <div className="check"><svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg></div>
@@ -1455,7 +1552,7 @@ function ManageBooking({ data, manageId, onCancel, onReschedule, go }) {
       )}
 
       {mode === "confirmReschedule" && (() => {
-        const nc = cohortTimes(ev).find((c) => c.id === newCohort);
+        const nc = cohortTimes(ev, newDate).find((c) => c.id === newCohort);
         return (
           <div className="rise d3 confirm-box">
             <h3 className="cb-title">Move your interview?</h3>
@@ -1481,8 +1578,9 @@ function CandidateConfirmation({ info, emailStatus, go }) {
   if (!info) return <Landing go={go} />;
   const { cand, ev, cohort, date } = info;
   const loc = ev.location || {};
-  const endTime = addMin(cohort.start, cohortDuration(ev));
   const evDate = date || cand.date;
+  const s = effectiveSettings(ev, evDate);
+  const endTime = addMin(cohort.start, cohortDuration(ev, evDate));
   const locStr = [loc.building, loc.room && `Room ${loc.room}`, loc.address].filter(Boolean).join(", ") || "TBA";
 
   return (
@@ -1511,11 +1609,11 @@ function CandidateConfirmation({ info, emailStatus, go }) {
 
         {/* format */}
         <div className="format-card rise d4">
-          <div className="fmt-step"><b>15 min</b><span>Behavioral</span></div>
+          <div className="fmt-step"><b>{s.behavioralMin} min</b><span>Behavioral</span></div>
           <div className="fmt-arrow">→</div>
-          <div className="fmt-step"><b>5 min</b><span>Transition</span></div>
+          <div className="fmt-step"><b>{s.bufferMin} min</b><span>Transition</span></div>
           <div className="fmt-arrow">→</div>
-          <div className="fmt-step"><b>45 min</b><span>Case Interview</span></div>
+          <div className="fmt-step"><b>{s.caseMin} min</b><span>Case Interview</span></div>
         </div>
 
         <p className="arrival-warn rise d4">{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
@@ -1577,15 +1675,33 @@ function InterviewAdmin({ data, save, logout }) {
     if (activeEvent && (!activeDate || !dates.includes(activeDate))) setActiveDate(dates[0] || null);
   }, [activeEventId, activeEvent, dates.join(",")]);
 
+  /* password gate for editing a published event — a real modal rather than
+     window.prompt, which sandboxed contexts (including this preview) silently
+     swallow. requestUnlock(ev) resolves true/false; components below call it
+     and await the result before saving. */
+  const unlockResolveRef = useRef(null);
+  const [gateOpen, setGateOpen] = useState(false);
+  const requestUnlock = (ev) => {
+    if (!ev || !ev.published) return Promise.resolve(true);
+    return new Promise((resolve) => { unlockResolveRef.current = resolve; setGateOpen(true); });
+  };
+  const resolveGate = (ok) => {
+    setGateOpen(false);
+    const r = unlockResolveRef.current;
+    unlockResolveRef.current = null;
+    if (r) r(ok);
+  };
+
   const tabs = [
     ["dashboard", "Dashboard"], ["events", "Interview Events"],
     ["candidates", "Candidates"], ["dayof", "Interview Day"],
     ["interviewers", "Interviewers"], ["settings", "Settings"],
   ];
-  const dateTabs = ["dashboard", "dayof", "interviewers", "settings"].includes(tab) && dates.length > 0;
+  const dateTabs = ["dashboard", "dayof", "interviewers", "settings", "events"].includes(tab) && dates.length > 0;
 
   return (
     <section className="page">
+      {gateOpen && <PasswordGateModal onResolve={resolveGate} />}
       <div className="admin-top rise d1">
         <div><h2 style={{ margin: 0 }}>Interview Administration</h2>
           <p className="muted" style={{ margin: "2px 0 0" }}>Prospective consultant interviews</p></div>
@@ -1623,11 +1739,11 @@ function InterviewAdmin({ data, save, logout }) {
       )}
 
       {tab === "dashboard" && <IADashboard key={activeEvent ? activeEvent.id : "none"} data={data} save={save} ev={activeEvent} date={activeDate} />}
-      {tab === "events" && <IAEvents data={data} save={save} activeEventId={activeEventId} setActiveEventId={setActiveEventId} />}
+      {tab === "events" && <IAEvents data={data} save={save} activeEventId={activeEventId} setActiveEventId={setActiveEventId} activeEvent={activeEvent} activeDate={activeDate} requestUnlock={requestUnlock} />}
       {tab === "candidates" && <IACandidates key={activeEvent ? activeEvent.id : "none"} data={data} save={save} ev={activeEvent} />}
       {tab === "dayof" && <IADayOf data={data} save={save} ev={activeEvent} date={activeDate} />}
       {tab === "interviewers" && <IAInterviewers key={activeEvent ? activeEvent.id : "none"} data={data} save={save} ev={activeEvent} date={activeDate} />}
-      {tab === "settings" && <IASettings key={activeEvent ? activeEvent.id : "none"} data={data} save={save} ev={activeEvent} date={activeDate} />}
+      {tab === "settings" && <IASettings key={activeEvent ? activeEvent.id : "none"} data={data} save={save} ev={activeEvent} date={activeDate} requestUnlock={requestUnlock} />}
     </section>
   );
 }
@@ -1637,12 +1753,13 @@ function IADashboard({ data, save, ev, date }) {
   /* live ticking clock so timers + "now" update every second */
   const [, force] = useState(0);
   useEffect(() => { const t = setInterval(() => force((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+  const [confirmReset, setConfirmReset] = useState(null); // cohort id pending a reset confirmation
 
   if (!ev) return <EmptyEvents />;
   if (!date) return <div className="empty-state fadein"><p>This event has no interview dates yet.</p><p className="muted">Add dates in <b>Settings</b>.</p></div>;
 
-  const cohorts = cohortTimes(ev);
-  const dur = cohortDuration(ev);
+  const cohorts = cohortTimes(ev, date);
+  const dur = cohortDuration(ev, date);
   const totalCap = cohorts.reduce((n, c) => n + cohortCapacity(ev, date, c.id), 0);
   const dayCandidates = cohorts.flatMap((c) => candidatesInCohort(data, ev.id, date, c.id));
   const scheduled = dayCandidates.length;
@@ -1660,7 +1777,12 @@ function IADashboard({ data, save, ev, date }) {
   const timerKey = (cid) => `${ev.id}|${date}|${cid}`;
   const timers = data.interviewTimers || {};
   const startTimer = (cid) => save((prev) => ({ ...prev, interviewTimers: { ...(prev.interviewTimers || {}), [timerKey(cid)]: Date.now() } }));
-  const resetTimer = (cid) => save((prev) => { const t = { ...(prev.interviewTimers || {}) }; delete t[timerKey(cid)]; return { ...prev, interviewTimers: t }; });
+  const resetTimer = (cid) => save((prev) => {
+    const t = { ...(prev.interviewTimers || {}) };
+    delete t[timerKey(cid)];
+    delete t[timerKey(cid) + "|done"]; // both the start AND done stamps must clear, or the card stays stuck showing "Complete"
+    return { ...prev, interviewTimers: t };
+  });
   const completeTimer = (cid) => save((prev) => ({ ...prev, interviewTimers: { ...(prev.interviewTimers || {}), [timerKey(cid) + "|done"]: Date.now() } }));
   const startMsOf = (cid) => timers[timerKey(cid)];
   const doneMsOf = (cid) => timers[timerKey(cid) + "|done"];
@@ -1698,6 +1820,20 @@ function IADashboard({ data, save, ev, date }) {
   const nextPod = cohorts.find((c) => !startMsOf(c.id) && !doneMsOf(c.id) && candidatesInCohort(data, ev.id, date, c.id).length > 0);
   const dayHasCands = dayCandidates.length > 0;
   const allComplete = dayHasCands && doneCount === scheduled;
+  const dayPct = scheduled ? Math.round((doneCount / scheduled) * 100) : 0;
+  const dayTone = allComplete ? "green" : worstLag >= 12 ? "red" : worstLag >= 4 ? "amber" : "green";
+
+  /* average how many minutes late each STARTED pod's behavioral round actually
+     kicked off vs. its plan — a steadier read on the night's overall pace than
+     just the single worst pod (which the status banner above already covers). */
+  const startLags = cohorts.map((c) => {
+    const list = candidatesInCohort(data, ev.id, date, c.id);
+    const sMs = startMsOf(c.id);
+    if (list.length === 0 || !sMs) return null;
+    const d = new Date(sMs);
+    return Math.round((d.getHours() * 60 + d.getMinutes()) - c.startMin);
+  }).filter((v) => v != null);
+  const avgStartLag = startLags.length ? Math.round(startLags.reduce((a, b) => a + b, 0) / startLags.length) : null;
 
   let status = null;
   if (dayHasCands) {
@@ -1721,13 +1857,23 @@ function IADashboard({ data, save, ev, date }) {
       )}
 
       <div className="day-banner">
-        <div>
-          <span className="day-banner-date">{prettyDate(date)}</span>
-          <span className="muted"> · {(ev.location?.building || "")}{ev.location?.room ? ` ${ev.location.room}` : ""}</span>
+        <div className="day-banner-left">
+          <ProgressRing pct={dayPct} size={44} stroke={5} tone={dayTone} />
+          <div>
+            <span className="day-banner-date">{prettyDate(date)}</span>
+            <span className="muted"> · {(ev.location?.building || "")}{ev.location?.room ? ` ${ev.location.room}` : ""}</span>
+          </div>
         </div>
         <div className="day-summary">
           <span><b>{doneCount}</b>/{scheduled} done</span>
           <span><b>{totalCap - scheduled}</b> open</span>
+          {avgStartLag != null && (
+            <span>
+              <b style={{ color: avgStartLag > 3 ? "#C0392B" : avgStartLag < -1 ? "var(--green)" : "#333" }}>
+                {avgStartLag > 0 ? `+${avgStartLag}` : avgStartLag}
+              </b> min avg start pace
+            </span>
+          )}
         </div>
       </div>
 
@@ -1742,7 +1888,11 @@ function IADashboard({ data, save, ev, date }) {
           const guestNames = (meta.guestIvs || []).filter(Boolean);
           const behavioralNames = (meta.behavioralIvs || []).filter(Boolean);
 
-          const startMs = startMsOf(c.id), dMs = doneMsOf(c.id);
+          /* a "done" stamp is only meaningful alongside a start stamp — guards
+             against any already-stored orphaned data from before resetTimer
+             was fixed to clear both keys together */
+          const startMs = startMsOf(c.id);
+          const dMs = startMs ? doneMsOf(c.id) : null;
           const running = !!startMs && !dMs;
           const elapsedMs = running ? now - startMs : 0;
           const elapsedMin = elapsedMs / 60000;
@@ -1756,10 +1906,20 @@ function IADashboard({ data, save, ev, date }) {
             : "Case";
           const late = !running && !dMs && isToday && nowMinOfDay > c.startMin + 3 && list.length > 0;
 
+          /* how many minutes after (or before) its planned time this pod's
+             behavioral round actually got started, once someone hits ▶ Start */
+          const startLagMin = startMs != null
+            ? (() => { const d = new Date(startMs); return Math.round((d.getHours() * 60 + d.getMinutes()) - c.startMin); })()
+            : null;
+          const ringTone = overtime ? "red" : (phase === "Behavioral" || phase === "Transition" || phase === "Case") ? "amber" : "green";
+
           return (
             <div key={c.id} className={`card cohort-card${closed ? " closed" : ""}${running ? " live" : ""}${overtime ? " overtime" : ""}${dMs ? " done" : ""}`}>
               <div className="cc-head">
-                <b>{c.start}</b>
+                <div className="cc-head-main">
+                  <ProgressRing pct={cohortPct} size={36} stroke={4} tone={ringTone} label={list.length ? `${cohortDone}/${list.length}` : "–"} />
+                  <b>{c.start}</b>
+                </div>
                 {dMs ? <span className="badge closed">✓ Complete</span>
                   : phase === "Overtime" ? <span className="badge over-badge">● OVERTIME</span>
                   : phase === "Case" ? <span className="badge live-badge">● Case now</span>
@@ -1773,6 +1933,11 @@ function IADashboard({ data, save, ev, date }) {
               {behavioralNames.length > 0 && (
                 <div className="cc-window" style={{ marginTop: -4 }}>Behavioral: {behavioralNames.join(", ")}</div>
               )}
+              {startLagMin != null && !dMs && (
+                <div className={`cc-pace${startLagMin > 3 ? " late" : startLagMin < -1 ? " early" : ""}`}>
+                  {startLagMin > 3 ? `Started ${startLagMin} min late` : startLagMin < -1 ? `Started ${-startLagMin} min early` : "Started on time"}
+                </div>
+              )}
 
               <div className="timer-row">
                 <div className={`timer-clock${overtime ? " over" : nearEnd ? " near" : ""}`}>
@@ -1781,9 +1946,16 @@ function IADashboard({ data, save, ev, date }) {
                 <div className="timer-btns">
                   {!startMs && <button className="timer-btn start" onClick={() => startTimer(c.id)}>▶ Start</button>}
                   {running && <button className="timer-btn done-btn" onClick={() => completeTimer(c.id)}>✓ Done</button>}
-                  {(startMs || dMs) && <button className="timer-btn reset" onClick={() => resetTimer(c.id)}>Reset</button>}
+                  {(startMs || dMs) && <button className="timer-btn reset" onClick={() => setConfirmReset(c.id)}>Reset</button>}
                 </div>
               </div>
+              {confirmReset === c.id && (
+                <div className="confirm-inline" style={{ marginTop: 4, marginBottom: 8 }}>
+                  <span className="confirm-q">Reset this pod's timer{dMs ? " — it's marked complete" : ""}?</span>
+                  <Btn kind="danger" small onClick={() => { resetTimer(c.id); setConfirmReset(null); }}>Yes, reset</Btn>
+                  <Btn kind="outline" small onClick={() => setConfirmReset(null)}>Cancel</Btn>
+                </div>
+              )}
               {overtime && <div className="over-alert">Over by {fmtElapsed(elapsedMs - dur * 60 * 1000)}</div>}
 
               <div className="cc-bar"><i style={{ width: `${cohortPct}%` }} /></div>
@@ -1821,7 +1993,7 @@ function IADashboard({ data, save, ev, date }) {
 
 
 /* ---- Events: create event (settings + first dates), reuse all semester ---- */
-function IAEvents({ data, save, activeEventId, setActiveEventId }) {
+function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, activeDate, requestUnlock }) {
   const d = CONFIG.interviewDefaults;
   const [f, setF] = useState({
     name: "", building: "", room: "", address: "",
@@ -1836,6 +2008,18 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
   const addDate = () => { if (dateInput && !dates.includes(dateInput)) { setDates([...dates, dateInput].sort()); setDateInput(""); } };
   const rmDate = (d) => setDates(dates.filter((x) => x !== d));
   const [confirmDel, setConfirmDel] = useState(null);
+
+  /* this date's timing-override form for the currently active event — the ONLY
+     place in the app that edits per-date timing/pod-count, per design: keeping
+     it off the Settings tab means there's exactly one place to look for it. */
+  const [ovForm, setOvForm] = useState(null);
+  useEffect(() => {
+    if (!activeEvent || !activeDate) { setOvForm(null); return; }
+    const s = effectiveSettings(activeEvent, activeDate);
+    setOvForm({ startTime: s.startTime, endTime: s.endTime, behavioralMin: s.behavioralMin,
+      bufferMin: s.bufferMin, caseMin: s.caseMin, leadTimeMin: s.leadTimeMin, candidatesPerCohort: s.candidatesPerCohort,
+      podsCount: s.podsCount != null ? String(s.podsCount) : "" });
+  }, [activeEvent && activeEvent.id, activeDate]);
 
   const preview = useMemo(() => {
     try {
@@ -1854,16 +2038,67 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
       startTime: f.startTime, endTime: f.endTime,
       behavioralMin: +f.behavioralMin, bufferMin: +f.bufferMin, caseMin: +f.caseMin,
       candidatesPerCohort: +f.candidatesPerCohort, leadTimeMin: +f.leadTimeMin,
-      cohortMeta: {}, arrivalInstruction: CONFIG.arrivalInstruction,
+      cohortMeta: {}, dateMeta: {}, arrivalInstruction: CONFIG.arrivalInstruction,
+      published: false,
     };
     await save((prev) => ({ ...prev, interviewEvents: [...(prev.interviewEvents || []), ev] }));
     setActiveEventId(ev.id);
     setF({ ...f, name: "" }); setDates([]);
   };
 
-  const removeEvent = async (id) =>
-    save((prev) => ({ ...prev, interviewEvents: (prev.interviewEvents || []).filter((e) => e.id !== id),
-      candidates: (prev.candidates || []).filter((c) => c.eventId !== id) }));
+  const removeEvent = async (e) => {
+    if (!(await requestUnlock(e))) return;
+    await save((prev) => ({ ...prev, interviewEvents: (prev.interviewEvents || []).filter((x) => x.id !== e.id),
+      candidates: (prev.candidates || []).filter((c) => c.eventId !== e.id) }));
+  };
+
+  /* Publishing itself needs no password — it's the deliberate act of locking the
+     event down. Un-publishing is itself a change to the event, so it's gated. */
+  const togglePublish = async (e) => {
+    if (e.published && !(await requestUnlock(e))) return;
+    await save((prev) => ({ ...prev, interviewEvents: (prev.interviewEvents || []).map((x) => x.id === e.id ? { ...x, published: !x.published } : x) }));
+  };
+
+  const ovField = (k) => (e) => setOvForm({ ...ovForm, [k]: e.target.value });
+  const saveOverride = async () => {
+    if (!activeEvent || !activeDate || !ovForm) return;
+    if (!(await requestUnlock(activeEvent))) return;
+    await save((prev) => ({
+      ...prev,
+      interviewEvents: (prev.interviewEvents || []).map((e) => e.id !== activeEvent.id ? e : {
+        ...e, dateMeta: { ...(e.dateMeta || {}), [activeDate]: {
+          startTime: ovForm.startTime, endTime: ovForm.endTime,
+          behavioralMin: +ovForm.behavioralMin, bufferMin: +ovForm.bufferMin,
+          caseMin: +ovForm.caseMin, leadTimeMin: +ovForm.leadTimeMin,
+          candidatesPerCohort: +ovForm.candidatesPerCohort,
+          podsCount: ovForm.podsCount === "" ? null : +ovForm.podsCount,
+        } },
+      }),
+    }));
+  };
+  const clearOverride = async () => {
+    if (!activeEvent || !activeDate) return;
+    if (!(await requestUnlock(activeEvent))) return;
+    await save((prev) => ({
+      ...prev,
+      interviewEvents: (prev.interviewEvents || []).map((e) => {
+        if (e.id !== activeEvent.id) return e;
+        const dm = { ...(e.dateMeta || {}) };
+        delete dm[activeDate];
+        return { ...e, dateMeta: dm };
+      }),
+    }));
+    const s = { startTime: activeEvent.startTime, endTime: activeEvent.endTime, behavioralMin: activeEvent.behavioralMin,
+      bufferMin: activeEvent.bufferMin, caseMin: activeEvent.caseMin, leadTimeMin: activeEvent.leadTimeMin,
+      candidatesPerCohort: activeEvent.candidatesPerCohort, podsCount: "" };
+    setOvForm(s);
+  };
+  const overridePreview = ovForm ? cohortTimes({
+    startTime: ovForm.startTime, endTime: ovForm.endTime,
+    behavioralMin: +ovForm.behavioralMin, bufferMin: +ovForm.bufferMin,
+    caseMin: +ovForm.caseMin, leadTimeMin: +ovForm.leadTimeMin,
+    podsCount: ovForm.podsCount === "" ? null : +ovForm.podsCount,
+  }) : [];
 
   return (
     <div className="fadein">
@@ -1912,6 +2147,62 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
         <Btn onClick={create} disabled={!f.name.trim() || preview.length === 0} style={{ marginTop: 8 }}>Create Event{dates.length ? ` · ${dates.length} date${dates.length === 1 ? "" : "s"}` : ""}</Btn>
       </div>
 
+      {activeEvent && activeDate && ovForm && (
+        <div className="card form-card" style={{ maxWidth: 640, marginTop: 26, marginBottom: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+            <h3 className="step-h" style={{ marginTop: 0, marginBottom: 0 }}>Timing for {prettyDate(activeDate)} · {activeEvent.name}</h3>
+            <span className={`ov-badge${hasDateOverride(activeEvent, activeDate) ? " custom" : ""}`}>
+              {hasDateOverride(activeEvent, activeDate) ? "Custom for this day" : "Using event default"}
+            </span>
+          </div>
+          <p className="muted" style={{ marginTop: 6, marginBottom: 14 }}>
+            Override the window, pod length, pod size, or exact pod count for just this one day — the other dates in this event keep the shared settings above. Useful for a lighter final day. Use the <b>date tabs</b> above to switch which day you're editing.
+          </p>
+          <div className="field-row">
+            <Field label="Start time" type="time" value={ovForm.startTime} onChange={ovField("startTime")} />
+            <Field label="End time" type="time" value={ovForm.endTime} onChange={ovField("endTime")} />
+          </div>
+          <div className="field-row-4">
+            <Field label="Behavioral (min)" type="number" min="1" value={ovForm.behavioralMin} onChange={ovField("behavioralMin")} />
+            <Field label="Buffer (min)" type="number" min="0" value={ovForm.bufferMin} onChange={ovField("bufferMin")} />
+            <Field label="Case (min)" type="number" min="1" value={ovForm.caseMin} onChange={ovField("caseMin")} />
+            <Field label="Lead time (min)" type="number" min="1" value={ovForm.leadTimeMin} onChange={ovField("leadTimeMin")} />
+          </div>
+          <div className="field-row">
+            <Field label="Candidates per pod" type="number" min="1" value={ovForm.candidatesPerCohort} onChange={ovField("candidatesPerCohort")} />
+            <Field label="Number of pods (optional)" type="number" min="1" placeholder="Auto from end time" value={ovForm.podsCount} onChange={ovField("podsCount")} />
+          </div>
+          <p className="muted" style={{ marginTop: -8, marginBottom: 10, fontSize: 12.5 }}>
+            Leave "Number of pods" blank to let the end time decide, as usual. Set a number to open <b>exactly</b> that many pods for this day no matter what the end time says — e.g. set it to 3 for a lighter final day so nothing past the 3rd pod is ever offered, even if you leave the end time later.
+          </p>
+
+          <div className="gen-preview" style={{ marginTop: 4 }}>
+            <span className="muted">This day will have <b style={{ color: "var(--green)" }}>{overridePreview.length}</b> pod{overridePreview.length === 1 ? "" : "s"} ({overridePreview.length * (+ovForm.candidatesPerCohort || 0)} spots):</span>
+            <div className="prev-pills">
+              {overridePreview.map((c) => <span key={c.id} className="prev-pill">{c.start}</span>)}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+            <Btn onClick={saveOverride}>Save timing for this day</Btn>
+            {hasDateOverride(activeEvent, activeDate) && <Btn kind="outline" onClick={clearOverride}>Reset to event default</Btn>}
+          </div>
+          {(() => {
+            const bookedOnDate = (data.candidates || []).filter((c) => c.eventId === activeEvent.id && c.date === activeDate && !c.cancelled).length;
+            return bookedOnDate > 0 ? (
+              <p className="err" style={{ marginTop: 10, fontSize: 12 }}>
+                Heads up: {bookedOnDate} candidate{bookedOnDate === 1 ? " is" : "s are"} already booked on this date. Pods are identified by position, not a fixed time — changing these settings can shift which clock time an already-booked pod actually falls on. Double-check the Candidates tab for this date after saving.
+              </p>
+            ) : (
+              <p className="muted" style={{ marginTop: 10, fontSize: 12 }}>No one is booked on this date yet, so it's safe to reshape freely.</p>
+            );
+          })()}
+          {activeEvent.published && (
+            <p className="notice" style={{ marginTop: 10, fontSize: 12.5 }}>🔒 This event is published — saving here will ask for the admin password.</p>
+          )}
+        </div>
+      )}
+
       {events.length > 0 && (
         <div style={{ marginTop: 26 }}>
           <h3 className="step-h">Your events</h3>
@@ -1921,21 +2212,26 @@ function IAEvents({ data, save, activeEventId, setActiveEventId }) {
               <div key={e.id} className="card event-row">
                 <div>
                   <b>{e.name}</b>
+                  {e.published ? <span className="badge closed" style={{ marginLeft: 8 }}>🔒 Published</span> : <span className="badge shift-badge" style={{ marginLeft: 8 }}>Draft</span>}
+                  <br />
                   <span className="muted"> · {(e.dates || []).length} date{(e.dates || []).length === 1 ? "" : "s"} · {cohortTimes(e).length} cohorts/day · {(e.location?.building || "TBA")}{e.location?.room ? ` ${e.location.room}` : ""}</span>
                 </div>
                 {confirmDel === e.id ? (
                   <div className="confirm-inline">
                     <span className="confirm-q">Delete this event{candCount ? ` and ${candCount} booking${candCount === 1 ? "" : "s"}` : ""}?</span>
-                    <Btn kind="danger" small onClick={() => { removeEvent(e.id); setConfirmDel(null); }}>Yes, delete</Btn>
+                    <Btn kind="danger" small onClick={() => { removeEvent(e); setConfirmDel(null); }}>Yes, delete</Btn>
                     <Btn kind="outline" small onClick={() => setConfirmDel(null)}>Keep</Btn>
                   </div>
                 ) : (
-                  <Btn kind="danger" small onClick={() => setConfirmDel(e.id)}>Delete</Btn>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Btn kind="outline" small onClick={() => togglePublish(e)}>{e.published ? "Unpublish" : "Publish"}</Btn>
+                    <Btn kind="danger" small onClick={() => setConfirmDel(e.id)}>Delete</Btn>
+                  </div>
                 )}
               </div>
             );
           })}
-          <p className="muted" style={{ marginTop: 6 }}>Add or remove interview dates for an event in the <b>Settings</b> tab.</p>
+          <p className="muted" style={{ marginTop: 6 }}>Add or remove interview dates for an event in the <b>Settings</b> tab. Once an event is <b>Published</b>, any change to it — here or in Settings — will ask for the admin password.</p>
         </div>
       )}
     </div>
@@ -1948,13 +2244,13 @@ function IACandidates({ data, save, ev }) {
   const [sortKey, setSortKey] = useState("datetime");
   if (!ev) return <EmptyEvents />;
   const rows = eventCandidates(data, ev);
-  const cohortStart = (id) => cohortTimes(ev).find((c) => c.id === id)?.start || "";
+  const cohortStart = (id, date) => cohortTimes(ev, date).find((c) => c.id === id)?.start || "";
 
   const filtered = rows
     .filter((c) => [c.name, c.email, c.purdueId].join(" ").toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => {
       if (sortKey === "name") return a.name.localeCompare(b.name);
-      if (sortKey === "datetime") return (a.date || "").localeCompare(b.date || "") || cohortStart(a.cohortId).localeCompare(cohortStart(b.cohortId));
+      if (sortKey === "datetime") return (a.date || "").localeCompare(b.date || "") || cohortStart(a.cohortId, a.date).localeCompare(cohortStart(b.cohortId, b.date));
       return (a.createdAt || "").localeCompare(b.createdAt || "");
     });
 
@@ -1965,9 +2261,9 @@ function IACandidates({ data, save, ev }) {
     const head = ["Name", "Email", "Purdue ID", "Phone", "Date", "Cohort Start", "Approx End", "Location", "Status", "Confirmation"];
     const loc = ev.location || {};
     const rowsCsv = filtered.map((c) => {
-      const co = cohortTimes(ev).find((k) => k.id === c.cohortId);
+      const co = cohortTimes(ev, c.date).find((k) => k.id === c.cohortId);
       return [c.name, c.email, c.purdueId, c.phone, prettyDate(c.date),
-        co?.start || "", co ? addMin(co.start, cohortDuration(ev)) : "",
+        co?.start || "", co ? addMin(co.start, cohortDuration(ev, c.date)) : "",
         [loc.building, loc.room].filter(Boolean).join(" "), c.status, c.id];
     });
     const esc = (v) => `"${String(v || "").replace(/"/g, '""')}"`;
@@ -2000,7 +2296,7 @@ function IACandidates({ data, save, ev }) {
                   <td>{c.email}</td>
                   <td>{c.purdueId}</td>
                   <td>{shortDate(c.date)}</td>
-                  <td>{cohortStart(c.cohortId)}</td>
+                  <td>{cohortStart(c.cohortId, c.date)}</td>
                   <td><span className={`status-badge s-${c.status.replace(/\s+/g, "").toLowerCase()}`}>{c.status}</span></td>
                   <td><Btn kind="danger" small onClick={() => cancel(c.id)}>Cancel</Btn></td>
                 </tr>
@@ -2020,7 +2316,7 @@ function IADayOf({ data, save, ev, date }) {
   const setStatus = async (id, status) =>
     save((prev) => ({ ...prev, candidates: (prev.candidates || []).map((c) => c.id === id ? { ...c, status } : c) }));
 
-  const cohorts = cohortTimes(ev);
+  const cohorts = cohortTimes(ev, date);
   const any = cohorts.some((c) => candidatesInCohort(data, ev.id, date, c.id).length > 0);
   return (
     <div className="fadein">
@@ -2076,7 +2372,7 @@ function IAInterviewers({ data, save, ev, date }) {
     setMeta(cohortId, { guestIvs: arr });
   };
 
-  const cohorts = cohortTimes(ev);
+  const cohorts = cohortTimes(ev, date);
 
   return (
     <div className="fadein">
@@ -2112,11 +2408,19 @@ function IAInterviewers({ data, save, ev, date }) {
 }
 
 /* ---- Settings: manage dates, per-cohort capacity/close, location, arrival note ---- */
-function IASettings({ data, save, ev, date }) {
-  /* hooks must run unconditionally every render — declare both before the early return */
+function IASettings({ data, save, ev, date, requestUnlock }) {
+  /* hooks must run unconditionally every render — declare all before the early return */
   const [newDate, setNewDate] = useState("");
   const [leadTimeField, setLeadTimeField] = useState((ev && ev.leadTimeMin) || 20);
   const [expectedCount, setExpectedCount] = useState("");
+  const [locForm, setLocForm] = useState(null); // buffered so typing doesn't trigger a password prompt per keystroke
+  const [capForm, setCapForm] = useState({}); // buffered per-cohort capacity inputs, keyed by cohort id
+  useEffect(() => {
+    if (!ev) { setLocForm(null); return; }
+    setLocForm({ building: ev.location?.building || "", room: ev.location?.room || "",
+      address: ev.location?.address || "", arrivalInstruction: ev.arrivalInstruction || "" });
+  }, [ev && ev.id]);
+  useEffect(() => { setCapForm({}); }, [ev && ev.id, date]);
   if (!ev) return <EmptyEvents />;
 
   const patchEvent = async (patch) =>
@@ -2124,10 +2428,12 @@ function IASettings({ data, save, ev, date }) {
 
   const addDate = async () => {
     if (!newDate || (ev.dates || []).includes(newDate)) return;
+    if (!(await requestUnlock(ev))) return;
     await patchEvent({ dates: [...(ev.dates || []), newDate].sort() });
     setNewDate("");
   };
   const removeDate = async (d) => {
+    if (!(await requestUnlock(ev))) return;
     await save((prev) => ({
       ...prev,
       interviewEvents: (prev.interviewEvents || []).map((e) => e.id === ev.id ? { ...e, dates: (e.dates || []).filter((x) => x !== d) } : e),
@@ -2135,30 +2441,42 @@ function IASettings({ data, save, ev, date }) {
     }));
   };
   const setMeta = async (cohortId, patch) => {
+    if (!(await requestUnlock(ev))) return;
     const key = `${date}|${cohortId}`;
     await save((prev) => ({ ...prev, interviewEvents: (prev.interviewEvents || []).map((e) => e.id !== ev.id ? e : {
       ...e, cohortMeta: { ...(e.cohortMeta || {}), [key]: { ...((e.cohortMeta || {})[key] || {}), ...patch } },
     }) }));
   };
-  const setCapacity = (cohortId, val) => {
+  const saveCapacity = (cohortId) => {
+    const val = capForm[cohortId];
+    if (val === undefined) return;
     const booked = candidatesInCohort(data, ev.id, date, cohortId).length;
     setMeta(cohortId, { capacity: Math.max(booked, +val || 0) });
   };
-  const saveLeadTime = () => patchEvent({ leadTimeMin: +leadTimeField });
+  const saveLeadTime = async () => { if (!(await requestUnlock(ev))) return; return patchEvent({ leadTimeMin: +leadTimeField }); };
+  const saveLocation = async () => {
+    if (!locForm) return;
+    if (!(await requestUnlock(ev))) return;
+    return patchEvent({
+      location: { ...ev.location, building: locForm.building, room: locForm.room, address: locForm.address },
+      arrivalInstruction: locForm.arrivalInstruction,
+    });
+  };
 
   /* Fill pod slots front-to-back for the expected headcount on this date, and
      close whatever's left over (never closes a pod that already has bookings). */
   const applyExpected = async () => {
     if (!date) return;
+    if (!(await requestUnlock(ev))) return;
     const n = +expectedCount || 0;
-    const perCohort = ev.candidatesPerCohort || 4;
+    const perCohort = effectiveSettings(ev, date).candidatesPerCohort || 4;
     const needed = n > 0 ? Math.ceil(n / perCohort) : Infinity;
     await save((prev) => ({
       ...prev,
       interviewEvents: (prev.interviewEvents || []).map((e) => {
         if (e.id !== ev.id) return e;
         const meta = { ...(e.cohortMeta || {}) };
-        cohortTimes(e).forEach((c, i) => {
+        cohortTimes(e, date).forEach((c, i) => {
           const key = `${date}|${c.id}`;
           const booked = candidatesInCohort(data, e.id, date, c.id).length;
           meta[key] = { ...(meta[key] || {}), closed: booked === 0 ? i >= needed : (meta[key] || {}).closed };
@@ -2170,6 +2488,12 @@ function IASettings({ data, save, ev, date }) {
 
   return (
     <div className="fadein">
+      {ev.published && (
+        <p className="notice" style={{ marginBottom: 20 }}>
+          🔒 This event is <b>published</b>. Any change here will ask for the admin password first.
+        </p>
+      )}
+
       <div className="card form-card" style={{ maxWidth: 640, marginBottom: 24 }}>
         <h3 className="step-h" style={{ marginTop: 0 }}>Pod timing</h3>
         <p className="muted" style={{ marginTop: -6, marginBottom: 14 }}>How many minutes before the previous pod's case round ends the next pod's behavioral round starts. Existing bookings aren't affected.</p>
@@ -2179,7 +2503,7 @@ function IASettings({ data, save, ev, date }) {
 
       <div className="card form-card" style={{ maxWidth: 640, marginBottom: 24 }}>
         <h3 className="step-h" style={{ marginTop: 0 }}>Interview dates</h3>
-        <p className="muted" style={{ marginTop: -6, marginBottom: 14 }}>Add every day you'll run interviews for this event. They all share the same location, format, and time window.</p>
+        <p className="muted" style={{ marginTop: -6, marginBottom: 14 }}>Add every day you'll run interviews for this event. They all share the same location, format, and time window. Per-day timing overrides (including exact pod count) live on the <b>Interview Events</b> tab.</p>
         <div className="date-add-row">
           <input type="date" className="date-add-input" value={newDate} onChange={(e) => setNewDate(e.target.value)} />
           <Btn small onClick={addDate} disabled={!newDate}>+ Add date</Btn>
@@ -2197,14 +2521,19 @@ function IASettings({ data, save, ev, date }) {
 
       <div className="card form-card" style={{ maxWidth: 640, marginBottom: 24 }}>
         <h3 className="step-h" style={{ marginTop: 0 }}>Location & instructions</h3>
-        <div className="field-row">
-          <Field label="Building" value={ev.location?.building || ""} onChange={(e) => patchEvent({ location: { ...ev.location, building: e.target.value } })} />
-          <Field label="Room" value={ev.location?.room || ""} onChange={(e) => patchEvent({ location: { ...ev.location, room: e.target.value } })} />
-        </div>
-        <Field label="Address (optional)" value={ev.location?.address || ""} onChange={(e) => patchEvent({ location: { ...ev.location, address: e.target.value } })} />
-        <label className="field"><span>Arrival instruction</span>
-          <input value={ev.arrivalInstruction || ""} onChange={(e) => patchEvent({ arrivalInstruction: e.target.value })} />
-        </label>
+        {locForm && (
+          <>
+            <div className="field-row">
+              <Field label="Building" value={locForm.building} onChange={(e) => setLocForm({ ...locForm, building: e.target.value })} />
+              <Field label="Room" value={locForm.room} onChange={(e) => setLocForm({ ...locForm, room: e.target.value })} />
+            </div>
+            <Field label="Address (optional)" value={locForm.address} onChange={(e) => setLocForm({ ...locForm, address: e.target.value })} />
+            <label className="field"><span>Arrival instruction</span>
+              <input value={locForm.arrivalInstruction} onChange={(e) => setLocForm({ ...locForm, arrivalInstruction: e.target.value })} />
+            </label>
+            <Btn onClick={saveLocation} style={{ marginTop: 8 }}>Save location & instructions</Btn>
+          </>
+        )}
       </div>
 
       {date && (
@@ -2218,15 +2547,16 @@ function IASettings({ data, save, ev, date }) {
             </div>
           </div>
           <h3 className="step-h">Per-cohort capacity · {prettyDate(date)}</h3>
-          {cohortTimes(ev).map((c) => {
+          {cohortTimes(ev, date).map((c) => {
             const booked = candidatesInCohort(data, ev.id, date, c.id).length;
             const closed = cohortClosed(ev, date, c.id);
+            const capVal = capForm[c.id] !== undefined ? capForm[c.id] : cohortCapacity(ev, date, c.id);
             return (
               <div key={c.id} className="card cohort-setting">
                 <b>{c.start}</b>
                 <span className="muted">{booked} booked</span>
                 <label className="cap-field">Capacity
-                  <input type="number" min={booked} value={cohortCapacity(ev, date, c.id)} onChange={(e) => setCapacity(c.id, e.target.value)} />
+                  <input type="number" min={booked} value={capVal} onChange={(e) => setCapForm({ ...capForm, [c.id]: e.target.value })} onBlur={() => saveCapacity(c.id)} />
                 </label>
                 <Btn kind="outline" small onClick={() => setMeta(c.id, { closed: !closed })}>{closed ? "Reopen" : "Close"}</Btn>
               </div>
@@ -2587,8 +2917,16 @@ tr:hover td { background: #FAFBF7; }
 .cohort-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; margin-top: 8px; }
 .cohort-card { padding: 18px 20px; }
 .cohort-card.closed { opacity: .6; }
-.cc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.cc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px; }
 .cc-head b { font-family: 'Space Grotesk', sans-serif; font-size: 19px; }
+.cc-head-main { display: flex; align-items: center; gap: 10px; }
+.cc-pace { font-size: 12px; font-weight: 700; color: #999; margin: -4px 0 8px; font-family: 'Space Grotesk', sans-serif; }
+.cc-pace.late { color: #C0392B; }
+.cc-pace.early { color: var(--greenDark); }
+.progress-ring { position: relative; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.progress-ring-label { position: absolute; font-size: 10.5px; font-weight: 700; color: #444; font-family: 'Space Grotesk', sans-serif; }
+.day-banner-left { display: flex; align-items: center; gap: 14px; }
+.day-banner-left .progress-ring-label { font-size: 12px; }
 .badge { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 11px; padding: 4px 11px; border-radius: 999px; }
 .badge.open { background: var(--tint); color: var(--greenDark); }
 .badge.full { background: #FDECEA; color: #C0392B; }
@@ -2712,6 +3050,8 @@ tr:hover td { background: #FAFBF7; }
   font-size: 14px; cursor: pointer; line-height: 1; }
 .date-chip button:hover { background: #C0392B; color: #fff; }
 .pill-sub { font-weight: 600; font-size: 12.5px; opacity: .8; }
+.ov-badge { font-size: 11.5px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: #EEE; color: #777; white-space: nowrap; }
+.ov-badge.custom { background: var(--tint); color: var(--greenDark); }
 .event-pick { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
 .event-pick .dropdown { margin-bottom: 0; }
 
@@ -2813,6 +3153,12 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .cand-noshow { font-size: 12px; font-weight: 700; color: #C0392B; }
 .confirm-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .confirm-q { font-size: 13px; font-weight: 600; color: #C0392B; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(20,22,16,.55); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
+.modal-card { background: var(--card, #fff); border-radius: 18px; padding: 26px 28px; max-width: 380px; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+.modal-pw-input { width: 100%; box-sizing: border-box; padding: 11px 14px; border-radius: 10px; border: 1.5px solid #DDD; font-size: 15px; font-family: inherit; }
+.modal-pw-input:focus { outline: none; border-color: var(--green); }
+.site.dark .modal-card { background: #1E2117; }
+.site.dark .modal-pw-input { background: #262B1E; border-color: #3A4030; color: #F3F5EC; }
 .manage-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .check.gray { background: #999; }
 .arrival-warn { color: #C0392B; font-weight: 700; font-size: 14px; text-align: center; max-width: 480px; margin-left: auto; margin-right: auto; }
@@ -2922,6 +3268,8 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .site.dark .timer-row { background: #14160F; border-color: #2C3025; }
 .site.dark .timer-clock { color: #E8EAE0; }
 .site.dark .cc-window { color: #7E8474; }
+.site.dark .progress-ring-label { color: #E4E7DC; }
+.site.dark .cc-pace { color: #7E8474; }
 .site.dark .cc-bar { background: #2C3025; }
 .site.dark .cand-prog { border-color: #23271D; }
 .site.dark .stg { background: #33382A; }
