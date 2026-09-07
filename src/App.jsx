@@ -103,11 +103,16 @@ const CONFIG = {
     bufferMin: 5,
     caseMin: 40,
     leadTimeMin: 20,               // next pod's behavioral starts this many min before the PREVIOUS pod's case ends
-    arrivalLeadMin: 10,           // "arrive 5–10 min early"
-    startTime: "17:00",
-    endTime: "21:00",
+    arrivalLeadMin: 10,           // "arrive 10–15 min early"
+    startTime: "17:00",           // 5:00 PM
+    endTime: "20:00",             // 8:00 PM — simple default window; admins can still widen it per event
   },
-  arrivalInstruction: "Please arrive 5–10 minutes before your scheduled start time.",
+  arrivalInstruction: "Please arrive 10–15 minutes before your scheduled start time.",
+  timeZoneLabel: "West Lafayette, IN (Eastern Time)",
+  /* How long a candidate's chosen slot is held exclusively for them once they
+     pick it, before it's released back to everyone else if they never finish
+     booking. See holdSlot/releaseSlot and the slotHolds data below. */
+  slotHoldMinutes: 2,
 };
 
 /* ---------------- helpers ---------------- */
@@ -151,6 +156,7 @@ const emptyData = {
   interviewEvents: [],   // [{ id, name, dates:["YYYY-MM-DD"], location{building,room,address,notes}, startTime, endTime, behavioralMin, bufferMin, caseMin, candidatesPerCohort, leadTimeMin, cohortMeta:{}, arrivalInstruction }]
   candidates: [],        // [{ id, eventId, date, cohortId, name, email, purdueId, phone, status, createdAt, cancelled }]
   interviewTimers: {},   // { "<eventId>|<date>|<cohortId>": startMs }
+  slotHolds: [],         // [{ id, eventId, date, cohortId, expiresAt }] — temporary reservations while someone fills out the booking form
 };
 
 /* Effective Teams link for a member: link saved in the Team Area wins,
@@ -327,6 +333,7 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
     arrival_note: ev.arrivalInstruction || CONFIG.arrivalInstruction,
     manage_link: `${CONFIG.siteUrl}/?manage=${cand.id}`,
     booking_type: kind === "rescheduled" ? "Rescheduled" : "New booking",
+    time_zone: CONFIG.timeZoneLabel,
   };
   try {
     await fetch("https://api.emailjs.com/api/v1.0/email/send", {
@@ -347,15 +354,35 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
    ------------------------------------------------------------
    One spreadsheet, several tabs, kept in sync as things happen in the app:
 
-   - "All Bookings" — one row per candidate, matched by Booking ID and
-     updated IN PLACE (never duplicated), including on reschedule.
+   - "All Bookings" — one row per candidate (Name/Email/Purdue ID/Phone/
+     Event/Date/Time/Booking ID — no Status column, this tab is just the
+     roster), matched by Booking ID and updated IN PLACE (never
+     duplicated), including on reschedule. Like "Interviewers" below, this
+     spans every date in one place, so it's ALSO kept sorted by date then
+     time with a divider line between groups. Note: this means the Date
+     column shows the raw ISO date (e.g. "2026-09-06") rather than a
+     pretty label — same reliable-sorting tradeoff as "Interviewers".
    - One tab PER INTERVIEW DATE (auto-created, named by the ISO date e.g.
-     "2026-09-06") — just Name / Email / Time / Status, matched by email
-     (unique within an event already, per the app's own duplicate-booking
-     guard). Rows get added/updated/deleted/moved as things change.
+     "2026-09-06") — Name / Email / Time / Status / Checked In At, matched
+     by email (unique within an event already, per the app's own
+     duplicate-booking guard). Rows get added/updated/deleted/moved as
+     things change, and are kept SORTED BY TIME so everyone in the same
+     pod timing sits together, WITH A DIVIDER LINE drawn under the last
+     row of each timing group so the different pods are visually easy to
+     tell apart at a glance. "Checked In At" is stamped once, the first
+     time status becomes "Checked In", and stays put through Behavioral/
+     Case/Completed — it's not overwritten by later updates.
    - "No Shows" — Name / Email / Purdue ID / Phone / Booking ID / their
      original date & time. Row is colored red and removed from the date
      tab once it lands here.
+   - "Interviewers" — one row PER POD, Date / Time / Behavioral
+     Interviewers / Case Interviewers / Submitted At, written when the
+     admin hits "Submit" on that pod's roster (see IAInterviewers). Since
+     this tab spans every date in one place (unlike the per-date candidate
+     tabs), it's matched by (Date, Time) and kept sorted by date THEN
+     time, with the same kind of divider line drawn whenever either
+     changes — so a day's worth of pods group together, and within a day
+     the different timings are easy to tell apart.
 
    Setup: paste the Apps Script below into the SAME spreadsheet/project as
    before (replacing what's there), keep the same deployment URL/secret —
@@ -365,26 +392,45 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
 
      var MASTER_TAB = "All Bookings";
      var NOSHOW_TAB = "No Shows";
+     var IV_TAB = "Interviewers";
 
+     // A script-wide lock serializes concurrent requests — without it, two
+     // people clicking status buttons (or a candidate booking) at nearly the
+     // same instant could each read the sheet before the other has written,
+     // and one write could clobber or duplicate the other. At dozens of
+     // entries this queues near-instantly; it only matters when two requests
+     // genuinely overlap.
      function doPost(e) {
-       var data = JSON.parse(e.postData.contents);
-       if (data.secret !== EXPECTED_SECRET) return json({ ok: false, error: "bad secret" });
-       var ss = SpreadsheetApp.getActiveSpreadsheet();
-       if (data.action === "book" || data.action === "status") {
-         upsertMaster(ss, data);
-         upsertDateRow(ss, data.date, data);
-       } else if (data.action === "noshow") {
-         upsertMaster(ss, data);
-         markNoShow(ss, data.date, data);
-       } else if (data.action === "reschedule") {
-         upsertMaster(ss, data);
-         if (data.prevDate && data.prevDate !== data.date) removeRowByEmail(ss, data.prevDate, data.email);
-         upsertDateRow(ss, data.date, data);
-       } else if (data.action === "cancel") {
-         upsertMaster(ss, data);
-         removeRowByEmail(ss, data.date, data.email);
+       var lock = LockService.getScriptLock();
+       try {
+         lock.waitLock(10000);
+       } catch (err) {
+         return json({ ok: false, error: "busy, try again" });
        }
-       return json({ ok: true });
+       try {
+         var data = JSON.parse(e.postData.contents);
+         if (data.secret !== EXPECTED_SECRET) return json({ ok: false, error: "bad secret" });
+         var ss = SpreadsheetApp.getActiveSpreadsheet();
+         if (data.action === "book" || data.action === "status") {
+           upsertMaster(ss, data);
+           upsertDateRow(ss, data.date, data);
+         } else if (data.action === "noshow") {
+           upsertMaster(ss, data);
+           markNoShow(ss, data.date, data);
+         } else if (data.action === "reschedule") {
+           upsertMaster(ss, data);
+           if (data.prevDate && data.prevDate !== data.date) removeRowByEmail(ss, data.prevDate, data.email);
+           upsertDateRow(ss, data.date, data);
+         } else if (data.action === "cancel") {
+           upsertMaster(ss, data);
+           removeRowByEmail(ss, data.date, data.email);
+         } else if (data.action === "interviewers") {
+           upsertInterviewerRow(ss, data);
+         }
+         return json({ ok: true });
+       } finally {
+         lock.releaseLock();
+       }
      }
 
      function json(obj) {
@@ -393,8 +439,8 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
 
      function getOrCreateSheet(ss, name, header) {
        var sheet = ss.getSheetByName(name);
-       if (!sheet) {
-         sheet = ss.insertSheet(name);
+       if (!sheet) sheet = ss.insertSheet(name);
+       if (sheet.getLastRow() === 0) { // covers a freshly-created tab AND a pre-existing empty one
          sheet.appendRow(header);
          sheet.getRange(1, 1, 1, header.length).setFontWeight("bold");
        }
@@ -407,18 +453,125 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
        return -1;
      }
 
+     function timeToMinutes(t) {
+       var m = /(\d+):(\d+)\s*(AM|PM)/i.exec(t || "");
+       if (!m) return 0;
+       var h = parseInt(m[1], 10) % 12;
+       if (m[3].toUpperCase() === "PM") h += 12;
+       return h * 60 + parseInt(m[2], 10);
+     }
+
+     function sortSheetByTime(sheet) {
+       var lastRow = sheet.getLastRow();
+       if (lastRow < 3) return; // header + 0/1 data rows — nothing to sort
+       var numCols = sheet.getLastColumn();
+       var range = sheet.getRange(2, 1, lastRow - 1, numCols);
+       var values = range.getValues();
+       values.sort(function (a, b) {
+         var ta = timeToMinutes(a[2]), tb = timeToMinutes(b[2]); // col C = Time
+         if (ta !== tb) return ta - tb;
+         return String(a[0]).localeCompare(String(b[0])); // tie-break by name
+       });
+       range.setValues(values);
+     }
+
+     // Draws a divider line under the last row of each timing group (e.g.
+     // under the final 5:00 PM row, before the first 6:00 PM row) so
+     // different pods are easy to tell apart at a glance. Clears any old
+     // borders first so a boundary line doesn't linger somewhere stale
+     // after rows move around.
+     function addTimeGroupBorders(sheet) {
+       var lastRow = sheet.getLastRow();
+       if (lastRow < 2) return;
+       var numCols = sheet.getLastColumn();
+       var dataRange = sheet.getRange(2, 1, lastRow - 1, numCols);
+       dataRange.setBorder(false, false, false, false, false, false);
+       if (lastRow < 3) return; // only one data row — nothing to divide
+       var values = dataRange.getValues();
+       for (var i = 0; i < values.length - 1; i++) {
+         if (values[i][2] !== values[i + 1][2]) {
+           var rowNum = i + 2;
+           sheet.getRange(rowNum, 1, 1, numCols)
+             .setBorder(null, null, true, null, null, null, "#888888", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+         }
+       }
+     }
+
+     function syncDateTabFormatting(sheet) {
+       sortSheetByTime(sheet);
+       addTimeGroupBorders(sheet);
+     }
+
+     // Sorts a tab by two given columns (Date, then Time) and draws a divider
+     // line wherever either changes — used for both "Interviewers" and
+     // "All Bookings", the two tabs that span every date in one place rather
+     // than having one tab per date.
+     function sortByDateThenTime(sheet, dateCol, timeCol) {
+       var lastRow = sheet.getLastRow();
+       if (lastRow >= 3) {
+         var numCols = sheet.getLastColumn();
+         var range = sheet.getRange(2, 1, lastRow - 1, numCols);
+         var values = range.getValues();
+         values.sort(function (a, b) {
+           if (a[dateCol] !== b[dateCol]) return String(a[dateCol]).localeCompare(String(b[dateCol])); // ISO dates sort correctly as text
+           return timeToMinutes(a[timeCol]) - timeToMinutes(b[timeCol]);
+         });
+         range.setValues(values);
+       }
+       addDateTimeGroupBorders(sheet, dateCol, timeCol);
+     }
+
+     function addDateTimeGroupBorders(sheet, dateCol, timeCol) {
+       var lastRow = sheet.getLastRow();
+       if (lastRow < 2) return;
+       var numCols = sheet.getLastColumn();
+       var dataRange = sheet.getRange(2, 1, lastRow - 1, numCols);
+       dataRange.setBorder(false, false, false, false, false, false);
+       if (lastRow < 3) return;
+       var values = dataRange.getValues();
+       for (var i = 0; i < values.length - 1; i++) {
+         if (values[i][dateCol] !== values[i + 1][dateCol] || values[i][timeCol] !== values[i + 1][timeCol]) {
+           var rowNum = i + 2;
+           sheet.getRange(rowNum, 1, 1, numCols)
+             .setBorder(null, null, true, null, null, null, "#888888", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+         }
+       }
+     }
+
+     // Simple trigger — Apps Script runs this automatically on ANY edit to the
+     // spreadsheet, no manual trigger setup needed. This is what makes grouping
+     // work even for a row someone typed in by hand, not just ones the app sent
+     // via doPost — since doPost already re-sorts on every write it makes, this
+     // mainly matters for manual edits, but running it either way keeps things
+     // correctly grouped no matter how a row got there.
+     function onEdit(e) {
+       var sheet = e.source.getActiveSheet();
+       var name = sheet.getName();
+       if (name === IV_TAB) { sortByDateThenTime(sheet, 0, 1); return; }       // Date=col A, Time=col B
+       if (name === MASTER_TAB) { sortByDateThenTime(sheet, 5, 6); return; }   // Date=col F, Time=col G
+       if (name === NOSHOW_TAB) return;
+       if (!/^\d{4}-\d{2}-\d{2}$/.test(name)) return; // only ISO-date-named tabs are per-date candidate tabs
+       syncDateTabFormatting(sheet);
+     }
+
      function upsertMaster(ss, data) {
-       var sheet = getOrCreateSheet(ss, MASTER_TAB, ["Name", "Email", "Purdue ID", "Phone", "Event", "Date", "Time", "Booking ID", "Status"]);
+       var sheet = getOrCreateSheet(ss, MASTER_TAB, ["Name", "Email", "Purdue ID", "Phone", "Event", "Date", "Time", "Booking ID"]);
        var row = findRow(sheet, 7, data.bookingId); // col H, 0-indexed = 7
-       var values = [data.name, data.email, data.purdueId, data.phone, data.eventName, data.dateLabel, data.time, data.bookingId, data.status];
+       var values = [data.name, data.email, data.purdueId, data.phone, data.eventName, data.date, data.time, data.bookingId];
        if (row === -1) sheet.appendRow(values); else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+       sortByDateThenTime(sheet, 5, 6); // Date=col F, Time=col G
      }
 
      function upsertDateRow(ss, date, data) {
-       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status"]);
+       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status", "Checked In At"]);
        var row = findRow(sheet, 1, data.email); // col B, 0-indexed = 1
-       var values = [data.name, data.email, data.time, data.status];
+       var checkedInAt = row !== -1 ? sheet.getRange(row, 5).getValue() : "";
+       if (data.status === "Checked In" && !checkedInAt) {
+         checkedInAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMM d, h:mm a");
+       }
+       var values = [data.name, data.email, data.time, data.status, checkedInAt];
        if (row === -1) sheet.appendRow(values); else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+       syncDateTabFormatting(sheet);
      }
 
      function removeRowByEmail(ss, date, email) {
@@ -426,15 +579,17 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
        if (!sheet) return;
        var row = findRow(sheet, 1, email);
        if (row !== -1) sheet.deleteRow(row);
+       syncDateTabFormatting(sheet);
      }
 
      function markNoShow(ss, date, data) {
-       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status"]);
+       var sheet = getOrCreateSheet(ss, date, ["Name", "Email", "Time", "Status", "Checked In At"]);
        var row = findRow(sheet, 1, data.email);
-       var values = [data.name, data.email, data.time, "No Show"];
+       var checkedInAt = row !== -1 ? sheet.getRange(row, 5).getValue() : "";
+       var values = [data.name, data.email, data.time, "No Show", checkedInAt];
        if (row === -1) { sheet.appendRow(values); row = sheet.getLastRow(); }
        else sheet.getRange(row, 1, 1, values.length).setValues([values]);
-       sheet.getRange(row, 1, 1, 4).setBackground("#f8d7da");
+       sheet.getRange(row, 1, 1, 5).setBackground("#f8d7da");
 
        var noshow = getOrCreateSheet(ss, NOSHOW_TAB, ["Name", "Email", "Purdue ID", "Phone", "Booking ID", "Original Date", "Original Time"]);
        var nsRow = findRow(noshow, 4, data.bookingId); // col E, 0-indexed = 4
@@ -444,16 +599,34 @@ async function sendCandidateEmail(cand, ev, cohort, date, kind = "booked") {
        noshow.getRange(nsRow, 1, 1, nsValues.length).setBackground("#f8d7da");
 
        sheet.deleteRow(row); // now logged in No Shows, drop from the date tab
+       syncDateTabFormatting(sheet);
+     }
+
+     function upsertInterviewerRow(ss, data) {
+       var sheet = getOrCreateSheet(ss, IV_TAB, ["Date", "Time", "Behavioral Interviewers", "Case Interviewers", "Submitted At"]);
+       var vals = sheet.getDataRange().getValues();
+       var row = -1;
+       for (var i = 1; i < vals.length; i++) {
+         if (vals[i][0] === data.date && vals[i][1] === data.time) { row = i + 1; break; }
+       }
+       var submittedAt = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMM d, h:mm a");
+       var values = [data.date, data.time, data.behavioral, data.caseIvs, submittedAt];
+       if (row === -1) sheet.appendRow(values); else sheet.getRange(row, 1, 1, values.length).setValues([values]);
+       sortByDateThenTime(sheet, 0, 1); // Date=col A, Time=col B
      }
 
    After pasting: Deploy → Manage deployments → edit the existing deployment
    → New version → Deploy (keeps the same URL, no CONFIG change needed).
 
-   Tabs are named by the RAW ISO date (e.g. "2026-09-06", matching the app's
-   internal date format) rather than a pretty label — keeps matching exact
-   and avoids characters Sheets tab names don't like. "All Bookings" and
-   "No Shows" show a human-readable date in their own Date/Original Date
-   column instead.
+   Date/tab-naming note: candidate date tabs are named by the RAW ISO date
+   (e.g. "2026-09-06", matching the app's internal date format) rather than
+   a pretty label — keeps matching exact and avoids characters Sheets tab
+   names don't like. "All Bookings" and "No Shows" show a human-readable
+   date in their own Date/Original Date column instead. The "Interviewers"
+   tab is the one exception: since it needs a real, sortable Date COLUMN
+   (not just a tab name) to group multiple dates in one place, that column
+   also uses the raw ISO format rather than a pretty label, for the same
+   reliable-sorting reason.
    ============================================================ */
 function syncCandidateToSheet(action, cand, ev, cohort, date, opts = {}) {
   if (!CONFIG.sheetsWebhookUrl) return;
@@ -473,6 +646,29 @@ function syncCandidateToSheet(action, cand, ev, cohort, date, opts = {}) {
     fetch(CONFIG.sheetsWebhookUrl, {
       method: "POST", mode: "no-cors",
       headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids a CORS preflight Apps Script won't answer
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  } catch (e) { /* best-effort only — never blocks the app */ }
+}
+
+/* Fires once a pod's interviewer roster is hit "Submit" (see IAInterviewers) —
+   writes to a separate "Interviewers" tab, matched by date+time (a pod's
+   date+time is unique within an event). Names are comma-joined into one cell
+   per role rather than one column per interviewer, since the count varies. */
+function syncInterviewersToSheet(ev, date, cohort, behavioralIvs, guestIvs) {
+  if (!CONFIG.sheetsWebhookUrl) return;
+  const payload = {
+    secret: CONFIG.sheetsWebhookSecret,
+    action: "interviewers",
+    eventName: ev?.name || "",
+    date: date, dateLabel: prettyDate(date), time: cohort?.start || "",
+    behavioral: (behavioralIvs || []).filter(Boolean).join(", "),
+    caseIvs: (guestIvs || []).filter(Boolean).join(", "),
+  };
+  try {
+    fetch(CONFIG.sheetsWebhookUrl, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify(payload),
     }).catch(() => {});
   } catch (e) { /* best-effort only — never blocks the app */ }
@@ -606,6 +802,29 @@ const candidatesInCohort = (data, eventId, date, cohortId) =>
 const cohortRemaining = (data, ev, date, cohortId) =>
   cohortCapacity(ev, date, cohortId) - candidatesInCohort(data, ev.id, date, cohortId).length;
 
+/* Active (non-expired) holds on a cohort by browsers OTHER than the given
+   hold — a candidate's own hold never counts against their own view of
+   availability, only against everyone else's. Holds are opportunistically
+   pruned wherever they're written (see holdSlot in App), so there's no
+   separate cleanup job needed for expired ones — anything past its
+   expiresAt is just ignored here. */
+const cohortHeldByOthers = (data, eventId, date, cohortId, excludeHoldId) =>
+  (data.slotHolds || []).filter((h) =>
+    h.eventId === eventId && h.date === date && h.cohortId === cohortId &&
+    h.expiresAt > Date.now() && h.id !== excludeHoldId).length;
+
+/* Seats actually available to book right now: real bookings AND other
+   people's active holds both count against capacity. This can't fully
+   eliminate two people clicking the exact same last seat in the exact same
+   instant (the app's storage has no atomic backend transaction — see the
+   earlier bug-review notes on that), but it shrinks the vulnerable window
+   from "however long someone takes to fill out the whole form" down to
+   "the moment of selection." The final capacity check at actual submit
+   time (see bookCandidate) remains the real backstop that prevents a
+   genuine double-booking from ever being saved as two real candidates. */
+const cohortBookableRemaining = (data, ev, date, cohortId, excludeHoldId) =>
+  cohortRemaining(data, ev, date, cohortId) - cohortHeldByOthers(data, ev.id, date, cohortId, excludeHoldId);
+
 /* local (not UTC) "today" — dates are stored as plain YYYY-MM-DD, so comparisons must
    stay in local time or evening interviews near a UTC day-rollover misfire */
 const todayLocalStr = () => {
@@ -615,13 +834,13 @@ const todayLocalStr = () => {
 const nowMinOfDayLocal = () => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); };
 
 /* dates on an event that still have any open, NOT-YET-STARTED cohort */
-const openDates = (data, ev) =>
+const openDates = (data, ev, excludeHoldId) =>
   eventDates(ev).filter((d) => d >= todayLocalStr() &&
-    cohortTimes(ev, d).some((c) => !cohortClosed(ev, d, c.id) && cohortRemaining(data, ev, d, c.id) > 0 &&
+    cohortTimes(ev, d).some((c) => !cohortClosed(ev, d, c.id) && cohortBookableRemaining(data, ev, d, c.id, excludeHoldId) > 0 &&
       !(d === todayLocalStr() && c.startMin <= nowMinOfDayLocal())));
 /* open, NOT-YET-STARTED cohort times on a specific date */
-const openCohortsOn = (data, ev, date) =>
-  date < todayLocalStr() ? [] : cohortTimes(ev, date).filter((c) => !cohortClosed(ev, date, c.id) && cohortRemaining(data, ev, date, c.id) > 0 &&
+const openCohortsOn = (data, ev, date, excludeHoldId) =>
+  date < todayLocalStr() ? [] : cohortTimes(ev, date).filter((c) => !cohortClosed(ev, date, c.id) && cohortBookableRemaining(data, ev, date, c.id, excludeHoldId) > 0 &&
     !(date === todayLocalStr() && c.startMin <= nowMinOfDayLocal()));
 
 /* all candidates for an event across dates */
@@ -653,8 +872,6 @@ const Field = ({ label, ...props }) => (
   </label>
 );
 
-/* Small circular completion indicator. pct 0-100. `tone` picks the ring color
-   independently of pct (e.g. red while a pod is overtime even at low %). */
 /* Blocking password modal for editing a published event. Resolves the Promise
    from requestUnlock() true/false — shows an inline "Incorrect password" and
    stays open on a wrong guess instead of closing, so a fumbled attempt doesn't
@@ -685,6 +902,8 @@ function PasswordGateModal({ onResolve, message }) {
   );
 }
 
+/* Small circular completion indicator. pct 0-100. `tone` picks the ring color
+   independently of pct (e.g. red while a pod is overtime even at low %). */
 const ProgressRing = ({ pct, size = 44, stroke = 5, tone = "green", label }) => {
   const p = Math.max(0, Math.min(100, pct));
   const r = (size - stroke) / 2;
@@ -722,6 +941,7 @@ export default function App() {
 
   useEffect(() => { document.title = CONFIG.siteName; }, []);
   const [manageId, setManageId] = useState(null);
+  const [holdExpiredNotice, setHoldExpiredNotice] = useState(false); // shown once on Landing after a held slot times out unbooked
   const [dark, setDark] = useState(() => { try { return localStorage.getItem("180dc-dark") === "1"; } catch { return false; } });
   useEffect(() => { try { localStorage.setItem("180dc-dark", dark ? "1" : "0"); } catch {} }, [dark]);
   useEffect(() => {
@@ -803,11 +1023,30 @@ export default function App() {
   };
 
   /* ---- prospective consultant booking ---- */
-  const bookCandidate = async (eventId, date, cohortId, form) => {
-    const ev = eventById(data, eventId);
-    const cohort = cohortTimes(ev, date).find((c) => c.id === cohortId);
+  /* Temporarily reserves a slot for CONFIG.slotHoldMinutes while a candidate
+     fills out the booking form, so a second person can't watch a slot as
+     "open" and book it out from under someone who already picked it. Each
+     write also opportunistically drops any already-expired holds, so this
+     list never grows unbounded even with no separate cleanup job. */
+  const holdSlot = (eventId, date, cohortId) => {
+    const id = `hold-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const expiresAt = Date.now() + (CONFIG.slotHoldMinutes || 2) * 60000;
+    save((prev) => ({
+      ...prev,
+      slotHolds: [...(prev.slotHolds || []).filter((h) => h.expiresAt > Date.now()), { id, eventId, date, cohortId, expiresAt }],
+    }));
+    return id;
+  };
+  const releaseSlot = (holdId) => {
+    if (!holdId) return;
+    save((prev) => ({ ...prev, slotHolds: (prev.slotHolds || []).filter((h) => h.id !== holdId) }));
+  };
+
+  const bookCandidate = async (eventId, date, cohortId, form, holdId) => {
+    const ev = eventById(dataRef.current, eventId);
+    const cohort = ev ? cohortTimes(ev, date).find((c) => c.id === cohortId) : null;
     if (!ev || !cohort) return { ok: false, msg: "That interview is no longer available." };
-    if (cohortClosed(ev, date, cohortId) || cohortRemaining(data, ev, date, cohortId) <= 0)
+    if (cohortClosed(ev, date, cohortId) || cohortRemaining(dataRef.current, ev, date, cohortId) <= 0)
       return { ok: false, msg: "That time just filled up — please pick another slot." };
     /* double-booking guard: same email or Purdue ID already booked in this event */
     const email = form.email.trim().toLowerCase();
@@ -827,6 +1066,7 @@ export default function App() {
       status: "Not Arrived", createdAt: new Date().toISOString(), cancelled: false,
     };
     await save((prev) => ({ ...prev, candidates: [...(prev.candidates || []), cand] }));
+    releaseSlot(holdId); // the real booking now counts toward capacity — the hold's job is done, clear it so it doesn't double-count for the next couple minutes
     setLastCandidate({ cand, ev, cohort, date });
     go("iv-confirm");
     syncCandidateToSheet("book", cand, ev, cohort, date, { status: "Not Arrived" });
@@ -879,7 +1119,8 @@ export default function App() {
           <Admin key="admin" data={data} save={save} closedKeys={closedKeys}
             user={teamUser} logout={() => { setTeamUser(null); go("home"); }} />
         ) : page === "interview" ? (
-          <InterviewBooking key="ivbook" data={data} onBook={bookCandidate} go={go} />
+          <InterviewBooking key="ivbook" data={data} onBook={bookCandidate} onHoldSlot={holdSlot} onReleaseSlot={releaseSlot}
+            onHoldExpired={() => setHoldExpiredNotice(true)} go={go} />
         ) : page === "iv-confirm" ? (
           <CandidateConfirmation key="ivconf" info={lastCandidate} emailStatus={candEmailStatus} go={go} />
         ) : page === "manage" ? (
@@ -890,7 +1131,7 @@ export default function App() {
         ) : page === "iv-admin" && ivAdmin ? (
           <InterviewAdmin key="ivadmin" data={data} save={save} logout={() => { setIvAdmin(false); go("home"); }} />
         ) : (
-          <Landing key="landing" go={go} />
+          <Landing key="landing" go={go} expiredNotice={holdExpiredNotice} onDismissExpiredNotice={() => setHoldExpiredNotice(false)} />
         )}
       </main>
       <Footer />
@@ -939,7 +1180,7 @@ function Header({ page, go, dark, setDark }) {
 }
 
 /* ---------------- Landing (two experiences) ---------------- */
-function Landing({ go }) {
+function Landing({ go, expiredNotice, onDismissExpiredNotice }) {
   return (
     <section className="page landing">
       <p className="eyebrow rise d1">180 Degrees Consulting · Purdue</p>
@@ -949,6 +1190,12 @@ function Landing({ go }) {
       <p className="lede rise d4" style={{ maxWidth: 620 }}>
         Book your in-person 180DC Purdue consultant interview — pick a date and time below to get started.
       </p>
+      {expiredNotice && (
+        <div className="notice rise d4" style={{ maxWidth: 620, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <span>Your held time slot expired after 2 minutes without completing the booking, so it's been released back to everyone else. Please pick a time again.</span>
+          <button type="button" onClick={onDismissExpiredNotice} aria-label="Dismiss" style={{ background: "none", border: "none", fontSize: 16, cursor: "pointer", color: "inherit", flexShrink: 0 }}>×</button>
+        </div>
+      )}
       <div className="choice-grid choice-grid-single rise d5">
         <button className="choice-card" onClick={() => go("interview")}>
           <div className="choice-top"><span className="choice-tag">Prospective Consultants</span><span className="choice-num">01</span></div>
@@ -1420,7 +1667,7 @@ function Footer() {
    ================================================================ */
 
 /* ---- Candidate booking wizard: 1 Details → 2 Select Interview → 3 Confirm ---- */
-function InterviewBooking({ data, onBook, go }) {
+function InterviewBooking({ data, onBook, onHoldSlot, onReleaseSlot, onHoldExpired, go }) {
   const events = (data.interviewEvents || []).filter((e) => openDates(data, e).length > 0);
   /* pick which event to book into: if multiple open events, let them choose; usually one */
   const [eventId, setEventId] = useState(events[0]?.id || null);
@@ -1431,11 +1678,60 @@ function InterviewBooking({ data, onBook, go }) {
   const [form, setForm] = useState({ name: "", email: "", purdueId: "", phone: "" });
   const [date, setDate] = useState(null);
   const [cohortId, setCohortId] = useState(null);
+  const [holdId, setHoldId] = useState(null); // the temporary reservation on cohortId, if any — see selectCohort
   const [error, setError] = useState("");
   const slideCls = dir === 1 ? "slide-fwd" : "slide-back";
   const set = (k) => (e) => { if (error) setError(""); setForm({ ...form, [k]: e.target.value }); };
 
-  const dates = ev ? openDates(data, ev) : [];
+  /* Releases whatever was held before, on EVERY exit path — picking a
+     different time, changing date/event, going back, or just leaving the
+     page — without needing to remember to call release manually at each
+     spot. Runs as the cleanup of this effect, which React fires right
+     before the next holdId's effect (or on unmount). */
+  useEffect(() => {
+    return () => { if (holdId) onReleaseSlot(holdId); };
+  }, [holdId]);
+
+  /* Ticks once a second so the countdown display stays live and so the
+     expiry check just below actually gets a chance to re-run while
+     someone is sitting on a step with an active hold. */
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  /* The hold's real expiry lives in shared data (data.slotHolds), not local
+     state — so this reads the authoritative timestamp rather than trusting
+     this one browser's clock to have started the countdown accurately. */
+  const activeHold = holdId ? (data.slotHolds || []).find((h) => h.id === holdId) : null;
+  const holdMsLeft = activeHold ? activeHold.expiresAt - Date.now() : null;
+  const holdSecsLeft = holdMsLeft != null ? Math.max(0, Math.ceil(holdMsLeft / 1000)) : null;
+  const holdCountdown = holdSecsLeft != null ? `${Math.floor(holdSecsLeft / 60)}:${String(holdSecsLeft % 60).padStart(2, "0")}` : null;
+
+  /* If the hold has actually run out — whether they never finished, got
+     distracted, or just walked away — release it and send them back to the
+     home page so the slot is genuinely open for someone else immediately,
+     not just eventually. Runs every render (no dependency array), which is
+     what lets it react within about a second of the real expiry moment
+     thanks to the ticking clock above; it's a no-op once holdId is null. */
+  useEffect(() => {
+    if (holdId && (!activeHold || holdMsLeft <= 0)) {
+      onReleaseSlot(holdId);
+      setHoldId(null);
+      setCohortId(null);
+      onHoldExpired();
+      go("home");
+    }
+  });
+
+  const selectCohort = (c) => {
+    const id = onHoldSlot(ev.id, date, c.id);
+    setCohortId(c.id);
+    setHoldId(id);
+  };
+
+  const dates = ev ? openDates(data, ev, holdId) : [];
   const cohort = ev && cohortId ? cohortTimes(ev, date).find((c) => c.id === cohortId) : null;
   const puidValid = /^\d{10}$/.test(form.purdueId.trim());
   const detailsValid = form.name.trim() && /^\S+@\S+\.\S+$/.test(form.email) && puidValid;
@@ -1461,8 +1757,8 @@ function InterviewBooking({ data, onBook, go }) {
 
   const submit = async () => {
     if (!ev || !date || !cohortId) return setError("Please choose a date and time.");
-    const r = await onBook(ev.id, date, cohortId, form);
-    if (!r.ok) { setError(r.msg); setStep(r.dup ? 1 : 3); if (!r.dup) setCohortId(null); }
+    const r = await onBook(ev.id, date, cohortId, form, holdId);
+    if (!r.ok) { setError(r.msg); setStep(r.dup ? 1 : 3); if (!r.dup) { setCohortId(null); setHoldId(null); } }
   };
 
   if (!ev || events.length === 0) {
@@ -1495,7 +1791,7 @@ function InterviewBooking({ data, onBook, go }) {
       {events.length > 1 && step === 1 && (
         <div className="event-pick rise d2">
           <span className="muted">Interviewing for:</span>
-          <select className="dropdown" value={eventId} onChange={(e) => { setEventId(e.target.value); setDate(null); setCohortId(null); }}>
+          <select className="dropdown" value={eventId} onChange={(e) => { setEventId(e.target.value); setDate(null); setCohortId(null); setHoldId(null); }}>
             {events.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
         </div>
@@ -1525,7 +1821,7 @@ function InterviewBooking({ data, onBook, go }) {
             {dates.map((d, i) => (
               <button key={d} className={`date-card stagger${date === d ? " is-selected" : ""}`}
                 style={{ animationDelay: `${Math.min(i * 25, 400)}ms` }}
-                onClick={() => { setDate(d); setCohortId(null); }}>
+                onClick={() => { setDate(d); setCohortId(null); setHoldId(null); }}>
                 <span>{shortDay(d)}</span><b>{shortDate(d)}</b>
               </button>
             ))}
@@ -1536,21 +1832,26 @@ function InterviewBooking({ data, onBook, go }) {
       {step === 3 && date && (
         <div className={slideCls} key="s3">
           <h3 className="step-h">Pick a time <span className="muted">· {prettyDate(date)}</span></h3>
-          <p className="muted" style={{ marginTop: -6 }}>Each session is ~{ev.behavioralMin + ev.bufferMin + ev.caseMin} minutes: {ev.behavioralMin}-min behavioral, {ev.bufferMin}-min transition, {ev.caseMin}-min case.</p>
+          <p className="muted" style={{ marginTop: -6 }}>Each session is ~{ev.behavioralMin + ev.bufferMin + ev.caseMin} minutes: {ev.behavioralMin}-min behavioral, {ev.bufferMin}-min transition, {ev.caseMin}-min case. Times below are local to {CONFIG.timeZoneLabel}.</p>
           <div className="time-box-grid">
-            {openCohortsOn(data, ev, date).map((c, i) => {
-              const left = cohortRemaining(data, ev, date, c.id);
+            {openCohortsOn(data, ev, date, holdId).map((c, i) => {
+              const left = cohortBookableRemaining(data, ev, date, c.id, holdId);
               return (
                 <button key={c.id}
                   className={`time-box stagger${cohortId === c.id ? " is-selected" : ""}`}
                   style={{ animationDelay: `${Math.min(i * 25, 300)}ms` }}
-                  onClick={() => setCohortId(c.id)}>
+                  onClick={() => selectCohort(c)}>
                   <b>{c.start}</b>
                   <span>{left === 1 ? "1 spot left" : `${left} spots left`}</span>
                 </button>
               );
             })}
           </div>
+          {cohortId && holdCountdown && (
+            <p className={`muted hold-countdown${holdSecsLeft <= 15 ? " urgent" : ""}`} style={{ fontSize: 12.5, marginTop: 10 }}>
+              ⏱ This time is held for you — <b>{holdCountdown}</b> left to finish booking.
+            </p>
+          )}
         </div>
       )}
 
@@ -1561,11 +1862,16 @@ function InterviewBooking({ data, onBook, go }) {
             <div className="confirm-review">
               <div className="d-row"><span>Name</span><b>{form.name}</b></div>
               <div className="d-row"><span>Date</span><b>{prettyDate(date)}</b></div>
-              <div className="d-row"><span>Interview start</span><b>{cohort.start}</b></div>
+              <div className="d-row"><span>Interview start</span><b>{cohort.start} · {CONFIG.timeZoneLabel}</b></div>
               <div className="d-row"><span>Location</span><b>{[loc.building, loc.room].filter(Boolean).join(", ") || "TBA"}</b></div>
               <div className="d-row"><span>Format</span><b>{ev.behavioralMin}-min behavioral · {ev.bufferMin}-min transition · {ev.caseMin}-min case</b></div>
             </div>
             <p className="arrival-warn" style={{ marginTop: 14 }}>{ev.arrivalInstruction || CONFIG.arrivalInstruction}</p>
+            {holdCountdown && (
+              <p className={`muted hold-countdown${holdSecsLeft <= 15 ? " urgent" : ""}`} style={{ fontSize: 12.5, marginTop: 4 }}>
+                ⏱ <b>{holdCountdown}</b> left before this slot is released — hit Confirm to lock it in.
+              </p>
+            )}
             {error && <p className="err">{error}</p>}
           </div>
         </div>
@@ -1771,11 +2077,12 @@ function CandidateConfirmation({ info, emailStatus, go }) {
           <div className="ch-date">{prettyDate(evDate)}</div>
           <div className="ch-time">{cohort.start}</div>
           <div className="ch-loc">{locStr}</div>
+          <div className="ch-tz">Times shown are local to {CONFIG.timeZoneLabel}</div>
         </div>
 
         {/* compact details */}
         <div className="confirm2-details rise d3">
-          <div className="c2-row"><span>Interview start</span><b>{cohort.start}</b></div>
+          <div className="c2-row"><span>Interview start</span><b>{cohort.start} · {CONFIG.timeZoneLabel}</b></div>
           <div className="c2-row"><span>Approx. end</span><b>{endTime}</b></div>
           <div className="c2-row"><span>Confirmation #</span><b>{cand.id}</b></div>
         </div>
@@ -1962,7 +2269,7 @@ function IADashboard({ data, save, ev, date }) {
 
   const now = Date.now();
   const nowD = new Date();
-  const isToday = date === nowD.toISOString().slice(0, 10);
+  const isToday = date === todayLocalStr(); // NOT toISOString() — that's UTC, and evening interviews can cross into "tomorrow" in UTC well before local midnight
   const nowMinOfDay = nowD.getHours() * 60 + nowD.getMinutes() + nowD.getSeconds() / 60;
   const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
   const fmtClock = (min) => { const h = Math.floor(min / 60), m = Math.round(min % 60); const ap = h >= 12 ? "PM" : "AM"; const h12 = ((h + 11) % 12) + 1; return `${h12}:${String(m).padStart(2, "0")} ${ap}`; };
@@ -2100,7 +2407,7 @@ function IADashboard({ data, save, ev, date }) {
                   : phase === "Behavioral" ? <span className="badge live-badge">● Behavioral now</span>
                   : late ? <span className="badge shift-badge">Hasn't started</span>
                   : <span className="muted cc-plan">{cohortDone}/{list.length || cap} done</span>}
-                <span className="cc-case-tag">Guest: {guestNames.length ? guestNames.join(" & ") : "not assigned"}</span>
+                <span className="cc-case-tag">Case: {guestNames.length ? guestNames.join(" & ") : "not assigned"}</span>
               </div>
               <div className="cc-window">Planned {c.start} – {minToClock(c.startMin + dur)}</div>
               {behavioralNames.length > 0 && (
@@ -2623,6 +2930,24 @@ function IAInterviewers({ data, save, ev, date }) {
   const commitBehavioral = commit("behavioralIvs");
   const commitGuest = commit("guestIvs");
 
+  /* Submitting locks the pod's fields (so a mid-interview-night glance
+     doesn't accidentally overwrite an already-settled roster) and pushes a
+     row to the "Interviewers" Sheets tab. Locking is per-POD, not the whole
+     day — different pods tend to get filled in at different times by
+     different people, so a whole-page lock would block people who aren't
+     done yet. Unlock ("Edit") is always available if something needs
+     correcting after the fact. */
+  const submitCohort = async (c) => {
+    const buf = localMeta[c.id] || {};
+    const remote = cohortMeta(ev, date, c.id);
+    const behavioralIvs = buf.behavioralIvs !== undefined ? buf.behavioralIvs : (remote.behavioralIvs || []);
+    const guestIvs = buf.guestIvs !== undefined ? buf.guestIvs : (remote.guestIvs || []);
+    await setMeta(c.id, { behavioralIvs, guestIvs, locked: true });
+    setLocalMeta((prev) => { const n = { ...prev }; delete n[c.id]; return n; });
+    syncInterviewersToSheet(ev, date, c, behavioralIvs, guestIvs);
+  };
+  const unlockCohort = (cohortId) => setMeta(cohortId, { locked: false });
+
   const cohorts = cohortTimes(ev, date);
 
   return (
@@ -2632,30 +2957,40 @@ function IAInterviewers({ data, save, ev, date }) {
       {cohorts.map((c) => {
         const cap = cohortCapacity(ev, date, c.id);
         const remoteMeta = cohortMeta(ev, date, c.id);
+        const locked = !!remoteMeta.locked;
         const buf = localMeta[c.id] || {};
         const behavioralIvs = buf.behavioralIvs !== undefined ? buf.behavioralIvs : (remoteMeta.behavioralIvs || []);
         const guestIvs = buf.guestIvs !== undefined ? buf.guestIvs : (remoteMeta.guestIvs || []);
         return (
-          <div key={c.id} className="card iv-assign">
-            <div className="do-head"><b>{c.start} Pod</b><span className="muted">capacity {cap}</span></div>
+          <div key={c.id} className={`card iv-assign${locked ? " locked" : ""}`}>
+            <div className="do-head">
+              <b>{c.start} Pod</b>
+              <span className="muted">capacity {cap}</span>
+              {locked && <span className="badge closed" style={{ marginLeft: 8 }}>✓ Submitted</span>}
+            </div>
             <div className="assign-grid">
               {Array.from({ length: cap * 2 }).map((_, i) => (
                 <label key={i} className="assign-field">
                   <span>Candidate {Math.floor(i / 2) + 1} — Behavioral IV {(i % 2) + 1}</span>
-                  <input value={behavioralIvs[i] || ""} onChange={(e) => setBehavioral(c.id, i, e.target.value)}
+                  <input value={behavioralIvs[i] || ""} disabled={locked} onChange={(e) => setBehavioral(c.id, i, e.target.value)}
                     onBlur={() => commitBehavioral(c.id)} placeholder="Interviewer name" />
                 </label>
               ))}
               <label className="assign-field">
-                <span>Guest Interviewer 1</span>
-                <input value={guestIvs[0] || ""} onChange={(e) => setGuest(c.id, 0, e.target.value)}
+                <span>Case Interviewer 1</span>
+                <input value={guestIvs[0] || ""} disabled={locked} onChange={(e) => setGuest(c.id, 0, e.target.value)}
                   onBlur={() => commitGuest(c.id)} placeholder="Interviewer name" />
               </label>
               <label className="assign-field">
-                <span>Guest Interviewer 2</span>
-                <input value={guestIvs[1] || ""} onChange={(e) => setGuest(c.id, 1, e.target.value)}
+                <span>Case Interviewer 2</span>
+                <input value={guestIvs[1] || ""} disabled={locked} onChange={(e) => setGuest(c.id, 1, e.target.value)}
                   onBlur={() => commitGuest(c.id)} placeholder="Interviewer name" />
               </label>
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+              {locked
+                ? <Btn kind="outline" small onClick={() => unlockCohort(c.id)}>Edit</Btn>
+                : <Btn small onClick={() => submitCohort(c)}>Submit</Btn>}
             </div>
           </div>
         );
@@ -3302,6 +3637,10 @@ tr:hover td { background: #FAFBF7; }
 .assign-field input { padding: 9px 12px; border: 1.5px solid #D8D8D3; border-radius: 8px; font-family: Inter, sans-serif;
   font-size: 14px; outline: none; transition: border-color .2s; }
 .assign-field input:focus { border-color: var(--green); }
+.assign-field input:disabled { background: #F5F5F0; color: #555; border-color: #E4E4DE; cursor: not-allowed; }
+.iv-assign.locked { background: #FBFBF8; }
+.site.dark .assign-field input:disabled { background: #23271B; color: #A9AD9E; border-color: #333A28; }
+.site.dark .iv-assign.locked { background: #1E2117; }
 .cohort-setting { display: flex; align-items: center; gap: 14px; padding: 13px 18px; margin-bottom: 10px; flex-wrap: wrap; }
 .cohort-setting > b { font-family: 'Space Grotesk', sans-serif; font-size: 16px; min-width: 74px; }
 .cap-field { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 700; color: #666;
@@ -3443,6 +3782,10 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .manage-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .check.gray { background: #999; }
 .arrival-warn { color: #C0392B; font-weight: 700; font-size: 14px; text-align: center; max-width: 480px; margin-left: auto; margin-right: auto; }
+.hold-countdown { font-weight: 600; }
+.hold-countdown b { font-family: 'Space Grotesk', sans-serif; }
+.hold-countdown.urgent { color: #C0392B; }
+.hold-countdown.urgent b { color: #C0392B; }
 .confirm-review + .arrival-warn { text-align: left; margin-left: 0; }
 
 
@@ -3632,6 +3975,7 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .ch-date { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px; color: var(--greenDark); letter-spacing: .01em; }
 .ch-time { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 46px; line-height: 1.05; color: #15170F; margin: 2px 0 6px; letter-spacing: -.02em; }
 .ch-loc { font-size: 14px; color: #5a6b3f; font-weight: 600; }
+.ch-tz { font-size: 11.5px; color: #8a8a80; font-weight: 600; margin-top: 4px; }
 
 .confirm2-details { width: 100%; border: 1.5px solid var(--line, #E7E7E2); border-radius: 14px; overflow: hidden; margin-bottom: 16px; }
 .c2-row { display: flex; justify-content: space-between; padding: 12px 18px; font-size: 14.5px; }
@@ -3650,6 +3994,7 @@ h1, .landing-h { letter-spacing: -0.015em; }
 .site.dark .ch-date { color: #B7E081; }
 .site.dark .ch-time { color: #F3F5EC; }
 .site.dark .ch-loc { color: #9DB87A; }
+.site.dark .ch-tz { color: #7E8474; }
 .site.dark .confirm2-details { border-color: #2C3025; }
 .site.dark .c2-row:nth-child(even) { background: #191C13; }
 .site.dark .c2-row b { color: #E8EAE0; }
