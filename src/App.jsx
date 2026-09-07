@@ -356,17 +356,19 @@ const cohortDuration = (ev) => ev.behavioralMin + ev.bufferMin + ev.caseMin;
    its BEHAVIORAL round begin `leadTimeMin` minutes before the PREVIOUS pod's
    CASE round is scheduled to end. This produces a steady cadence in practice
    (behavioralMin + bufferMin + caseMin − leadTimeMin) once past pod 1.
-   HARD DEADLINE: a pod is only generated if its behavioral round STARTS at or
-   before the event's end time. A pod that starts on time is kept even if its
-   case round runs past closing — that's normal, expected overrun, not a
-   scheduling violation. Nothing new is ever kicked off after closing time. */
+   HARD DEADLINE: a pod is only generated if its behavioral round starts STRICTLY
+   before the event's end time — starting exactly at closing time counts as
+   starting past it, since zero interview time would be left. A pod that starts
+   on time is kept even if its case round runs past closing — that's normal,
+   expected overrun, not a scheduling violation. Nothing new is ever kicked off
+   at or after closing time. */
 function cohortTimes(ev) {
   const start = clockToMin(ev.startTime), end = clockToMin(ev.endTime);
   const behavioral = ev.behavioralMin, buffer = ev.bufferMin, caseLen = ev.caseMin;
   const leadTime = ev.leadTimeMin != null ? ev.leadTimeMin : 20;
   const out = [];
   let behStart = start, i = 0;
-  while (behStart <= end + 0.001) {
+  while (behStart < end - 0.001) {
     const behEnd = behStart + behavioral;
     const caseStart = behEnd + buffer;
     const caseEnd = caseStart + caseLen;
