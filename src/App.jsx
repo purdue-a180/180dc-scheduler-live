@@ -61,7 +61,7 @@ const CONFIG = {
     templateId: "template_we57qxl",              // member interviewee email
     templateIdInterviewer: "template_10fsu3n",   // member interviewer email
     templateIdCandidate: "template_vvoklll",      // PROSPECTIVE-CONSULTANT email (used for both new bookings AND reschedules)
-    templateIdCandidateRescheduled: "",           // optional: a SEPARATE template for reschedules only. Leave blank to
+    templateIdCandidateRescheduled: "template_dzkehe6",  // optional: a SEPARATE template for reschedules only. Leave blank to
                                                    // keep reusing templateIdCandidate above (recommended — it already
                                                    // gets a {{booking_type}} variable of "New booking" or "Rescheduled",
                                                    // so one template can say the right thing either way). Only fill
