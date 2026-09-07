@@ -2106,13 +2106,6 @@ function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, ac
   const addDate = () => { if (dateInput && !dates.includes(dateInput)) { setDates([...dates, dateInput].sort()); setDateInput(""); } };
   const rmDate = (d) => setDates(dates.filter((x) => x !== d));
   const [confirmDel, setConfirmDel] = useState(null);
-  const [openMenuId, setOpenMenuId] = useState(null); // which event row's ⋯ menu is open
-  const [menuPos, setMenuPos] = useState(null); // {top, right} in viewport px, for the fixed-position menu below
-  const openMenu = (id, e) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    setMenuPos({ top: r.bottom + 4, right: window.innerWidth - r.right });
-    setOpenMenuId(openMenuId === id ? null : id);
-  };
 
   /* this date's timing-override form for the currently active event — the ONLY
      place in the app that edits per-date timing/pod-count, per design: keeping
@@ -2330,17 +2323,9 @@ function IAEvents({ data, save, activeEventId, setActiveEventId, activeEvent, ac
                     <Btn kind="outline" small onClick={() => setConfirmDel(null)}>Keep</Btn>
                   </div>
                 ) : (
-                  <div className="row-menu-wrap">
-                    <button className="row-menu-btn" onClick={(ev2) => openMenu(e.id, ev2)} aria-label="Event actions">⋯</button>
-                    {openMenuId === e.id && menuPos && (
-                      <>
-                        <div className="row-menu-backdrop" onClick={() => setOpenMenuId(null)} />
-                        <div className="row-menu" style={{ top: menuPos.top, right: menuPos.right }}>
-                          <button className="row-menu-item" onClick={() => { setOpenMenuId(null); togglePublish(e); }}>{e.published ? "Unpublish" : "Publish"}</button>
-                          <button className="row-menu-item danger" onClick={() => { setOpenMenuId(null); setConfirmDel(e.id); }}>Delete</button>
-                        </div>
-                      </>
-                    )}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Btn kind="outline" small onClick={() => togglePublish(e)}>{e.published ? "Unpublish" : "Publish"}</Btn>
+                    <Btn kind="danger" small onClick={() => setConfirmDel(e.id)}>Delete</Btn>
                   </div>
                 )}
               </div>
