@@ -86,13 +86,13 @@ const CONFIG = {
      URL (which is SSO-walled and needs a Vercel team login to open), that protected URL would
      otherwise get baked into the candidate's email permanently. Update this if the production
      domain ever changes. */
-  siteUrl: "https://180dc-scheduler.vercel.app",
+  siteUrl: "https://180dc-scheduler-live.vercel.app",
 
   /* ============================================================
      PROSPECTIVE-CONSULTANT INTERVIEW ADMIN
      Demo credentials only — CHANGE before production.
      ============================================================ */
-  interviewAdmin: { username: "180DC", password: "rishiisgreat" },
+  interviewAdmin: { username: "180purdue", password: "boilerup" },
 
   /* Defaults used when creating a new interview event */
   interviewDefaults: {
@@ -1432,7 +1432,7 @@ function InterviewBooking({ data, onBook, go }) {
             <h3 className="step-h" style={{ marginTop: 0 }}>Your details</h3>
             <p className="muted" style={{ marginTop: -6, marginBottom: 16 }}>Just the essentials — we already have your application on file.</p>
             <Field label="Full name" value={form.name} onChange={set("name")} placeholder="Boiler Maker" autoComplete="name" />
-            <Field label="Purdue email" type="email" value={form.email} onChange={set("email")} placeholder="you@purdue.edu" autoComplete="email" />
+            <Field label="Email" type="email" value={form.email} onChange={set("email")} placeholder="you@email.com" autoComplete="email" />
             <Field label="Purdue ID (10 digits)" value={form.purdueId}
               onChange={(e) => { if (error) setError(""); setForm({ ...form, purdueId: e.target.value.replace(/\D/g, "").slice(0, 10) }); }}
               inputMode="numeric" placeholder="0012345678" />
